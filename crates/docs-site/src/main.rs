@@ -94,8 +94,9 @@ fn main() -> ExitCode {
     match build_site(&args.root, &args.out) {
         Ok(report) => {
             println!(
-                "docs-site: validated {} page(s); output directory ready at {}",
+                "docs-site: validated {} page(s); wrote {} file(s) to {}",
                 report.pages,
+                report.written.len(),
                 report.out_dir.display()
             );
             ExitCode::SUCCESS

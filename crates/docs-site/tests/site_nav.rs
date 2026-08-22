@@ -51,6 +51,70 @@ fn valid_fixture_builds_and_reports_all_pages() {
     assert!(out.0.is_dir());
 }
 
+/// 受け入れ基準 2: 生成 HTML が nav.toml のセクション構造どおりのサイドバーを
+/// 持つこと（イシュー #870）。
+#[test]
+fn valid_fixture_generates_sidebar_matching_nav_structure() {
+    let root = fixture_root("valid");
+    let out = TempOutDir::new("valid-sidebar");
+    build_site(&root, &out.0).expect("valid fixture should build");
+
+    let html = std::fs::read_to_string(out.0.join("guide/intro/index.html"))
+        .expect("intro page should be written");
+
+    // セクション見出し・ページリンクが nav.toml の宣言順どおり現れる。
+    let guide_pos = html.find("Guide").expect("Guide section heading present");
+    let reference_pos = html
+        .find("Reference")
+        .expect("Reference section heading present");
+    assert!(
+        guide_pos < reference_pos,
+        "sections must keep declaration order"
+    );
+
+    assert!(html.contains("href=\"/guide/intro/\""));
+    assert!(html.contains("href=\"/guide/getting-started/\""));
+    assert!(html.contains("href=\"/reference/api/\""));
+    // 現在ページ（intro）に aria-current="page" が付与されている。
+    assert!(html.contains("aria-current=\"page\">Introduction</a>"));
+}
+
+/// Markdown 由来の各種タグが本文（`<article>`）に反映されていることの確認
+/// （受け入れ基準 1 の統合テスト側カバレッジ）。
+#[test]
+fn valid_fixture_renders_markdown_syntax_into_html() {
+    let root = fixture_root("valid");
+    let out = TempOutDir::new("valid-markdown");
+    build_site(&root, &out.0).expect("valid fixture should build");
+
+    let intro_html = std::fs::read_to_string(out.0.join("guide/intro/index.html")).unwrap();
+    assert!(intro_html.contains("<h1>Introduction</h1>"));
+    assert!(intro_html.contains("<ul><li>first item</li>"));
+    assert!(intro_html.contains("<blockquote>"));
+    assert!(intro_html.contains("<table>"));
+
+    let getting_started_html =
+        std::fs::read_to_string(out.0.join("guide/getting-started/index.html")).unwrap();
+    assert!(getting_started_html.contains("<pre><code class=\"language-rust\">"));
+    assert!(getting_started_html.contains("<strong>bold</strong>"));
+    assert!(getting_started_html.contains("<em>em</em>"));
+    assert!(getting_started_html.contains("<strong><em>bold+em</em></strong>"));
+    assert!(getting_started_html.contains("<a href=\"/guide/intro/\">link</a>"));
+}
+
+/// `assets/site.css` が生成されることの確認（テーマ CSS 書き出し。実装計画 §2.5）。
+#[test]
+fn valid_fixture_writes_theme_css_asset() {
+    let root = fixture_root("valid");
+    let out = TempOutDir::new("valid-css");
+    build_site(&root, &out.0).expect("valid fixture should build");
+
+    let css = std::fs::read_to_string(out.0.join("assets/site.css"))
+        .expect("assets/site.css should be written");
+    assert!(css.contains(":root"));
+    assert!(css.contains("prefers-color-scheme: dark"));
+}
+
 #[test]
 fn unknown_key_fixture_fails_closed_with_parse_error() {
     let root = fixture_root("unknown-key");

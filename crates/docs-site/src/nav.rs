@@ -15,10 +15,14 @@
 //!
 //! - `#` から始まる行コメント、および文字列値の終端後に続く `# ...`
 //! - `[site]` テーブル（`title` / `base_path` の 2 キー）
-//! - `[[section]]` array-of-tables（`title` の 1 キーのみ。参照実装
-//!   （fandhe-backend `crates/docs-site/src/nav.rs`）が持つ `index_path`
-//!   キーは本イシューのスキーマに含めない。未知キーは fail-closed で拒否されるため、
-//!   #870/#873 で必要になった時点でのキー追加は非互換を生まない）
+//! - `[[section]]` array-of-tables（`title` の 1 キー必須 + `index_path` の
+//!   1 キー任意。`index_path` はイシュー #870 で追加した拡張キーで、layout
+//!   モジュールがヘッダのセクションメニューのリンク先として使う。参照実装
+//!   （fandhe-backend `crates/docs-site/src/nav.rs`）の同キーに倣うが、
+//!   `page.path` 重複検査には含めない: 実 `site/nav.toml` は各セクションの
+//!   `index_path` がそのセクション内のいずれかの `page.path` と意図的に
+//!   一致する値を取るため（例: `index_path = "/guides/"` と
+//!   `page.path = "/guides/"` の共存）、含めると誤って `DuplicatePath` を誘発する
 //! - `[[section.page]]` array-of-tables（直前の `[[section]]` に属する。
 //!   `title` / `source` / `path` の 3 キー）
 //! - `key = "value"`（ダブルクォート文字列のみ。エスケープは `\"` `\\` `\n` `\t` の
@@ -71,6 +75,11 @@ pub struct Site {
 pub struct Section {
     /// サイドバーの見出しとして表示するセクションタイトル。
     pub title: String,
+    /// ヘッダのセクションメニューのリンク先（任意）。指定する場合は `page.path` と
+    /// 同じ形式規則（`/` 始まり・`/` 終わり・セグメントは英数字・`-`・`_`）を満たす
+    /// 必要がある（[`validate_page_path`]）。ページ実在との突合は行わない
+    /// （#872 linkcheck の責務。イシュー #870 実装計画 §2.3）。
+    pub index_path: Option<String>,
     /// 宣言順を保持したページ列（1 件以上。空セクションはパース時点でエラー）。
     pub pages: Vec<Page>,
 }
@@ -112,6 +121,9 @@ pub enum NavError {
     /// `page.path` が `/` 始まり・`/` 終わり、またはセグメントのホワイトリスト
     /// （英数字・`-`・`_`）を満たさない（`..` によるパストラバーサルを含む）。
     InvalidPagePath(String),
+    /// `section.index_path` が指定されているが `page.path` と同じ形式規則を
+    /// 満たさない。
+    InvalidIndexPath(String),
     /// `site.base_path` が `""` または `/` 始まり・`/` 終わりでない、の形式を満たさない。
     InvalidBasePath(String),
     /// 必須キーが欠落している。
@@ -145,6 +157,10 @@ impl fmt::Display for NavError {
                 f,
                 "page.path `{path}` must start and end with `/` with segments limited to alphanumerics, `-`, `_`"
             ),
+            NavError::InvalidIndexPath(path) => write!(
+                f,
+                "section.index_path `{path}` must start and end with `/` with segments limited to alphanumerics, `-`, `_`"
+            ),
             NavError::InvalidBasePath(base_path) => write!(
                 f,
                 "site.base_path `{base_path}` must be \"\" or start with `/` and not end with `/`"
@@ -166,6 +182,7 @@ impl std::error::Error for NavError {}
 /// 検証する（欠落順序に依存しない一貫したエラーにするため）。
 struct SectionBuilder {
     title: Option<String>,
+    index_path: Option<String>,
     pages: Vec<PageBuilder>,
 }
 
@@ -293,16 +310,19 @@ fn is_safe_path_segment(segment: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn validate_page_path(path: &str) -> Result<(), NavError> {
+/// `page.path` / `section.index_path` に共通の形式規則を検査する（`/` 始まり・
+/// `/` 終わり・内部セグメントは英数字・`-`・`_` のみ）。呼び出し元がそれぞれ
+/// 異なる [`NavError`] バリアントへ包む。
+fn path_format_is_valid(path: &str) -> bool {
     if !path.starts_with('/') || !path.ends_with('/') {
-        return Err(NavError::InvalidPagePath(path.to_string()));
+        return false;
     }
     if path.len() == 1 {
         // "/"（サイトトップ）はセグメントなしで許可する。開始・終了の '/' が
         // 同一バイトを指すため、下の `path[1..path.len() - 1]` スライス
         // （1..0）は範囲が逆転してパニックする。長さ 1 の場合はスライス計算に
         // 入る前に早期リターンする（参照実装 fandhe-backend #473 の教訓）。
-        return Ok(());
+        return true;
     }
     let inner = &path[1..path.len() - 1];
     if inner.is_empty() {
@@ -313,12 +333,26 @@ fn validate_page_path(path: &str) -> Result<(), NavError> {
         // （#870 が `page.path` を `--out` 配下の実ファイル書き出しパスとして使う
         // ため、"/" と "//" が別ページとして共存すると出力先の衝突・上書きに
         // つながる）。よってここは許可せず拒否する。
-        return Err(NavError::InvalidPagePath(path.to_string()));
+        return false;
     }
-    if inner.split('/').all(is_safe_path_segment) {
+    inner.split('/').all(is_safe_path_segment)
+}
+
+fn validate_page_path(path: &str) -> Result<(), NavError> {
+    if path_format_is_valid(path) {
         Ok(())
     } else {
         Err(NavError::InvalidPagePath(path.to_string()))
+    }
+}
+
+/// `section.index_path` の形式検証。ページ実在との突合は行わない（#872 の責務。
+/// モジュール冒頭コメント参照）。
+fn validate_index_path(path: &str) -> Result<(), NavError> {
+    if path_format_is_valid(path) {
+        Ok(())
+    } else {
+        Err(NavError::InvalidIndexPath(path.to_string()))
     }
 }
 
@@ -390,6 +424,7 @@ pub fn parse_nav(input: &str) -> Result<Nav, NavError> {
                 "section" => {
                     sections.push(SectionBuilder {
                         title: None,
+                        index_path: None,
                         pages: Vec::new(),
                     });
                     ctx = Ctx::Section(sections.len() - 1);
@@ -444,6 +479,12 @@ pub fn parse_nav(input: &str) -> Result<Nav, NavError> {
             },
             Ctx::Section(sidx) => match key {
                 "title" => set_once(&mut sections[sidx].title, value, line, "section.title")?,
+                "index_path" => set_once(
+                    &mut sections[sidx].index_path,
+                    value,
+                    line,
+                    "section.index_path",
+                )?,
                 other => {
                     return Err(parse_err(
                         line,
@@ -491,6 +532,9 @@ pub fn parse_nav(input: &str) -> Result<Nav, NavError> {
             context: "section".to_string(),
             key: "title".to_string(),
         })?;
+        if let Some(index_path) = &section.index_path {
+            validate_index_path(index_path)?;
+        }
         if section.pages.is_empty() {
             return Err(NavError::EmptySection(title));
         }
@@ -521,6 +565,7 @@ pub fn parse_nav(input: &str) -> Result<Nav, NavError> {
         }
         out_sections.push(Section {
             title,
+            index_path: section.index_path,
             pages: out_pages,
         });
     }
@@ -694,6 +739,76 @@ path = "/dup/"
             Err(NavError::DuplicatePath(path)) => assert_eq!(path, "/dup/"),
             other => panic!("expected DuplicatePath, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_optional_section_index_path() {
+        let input = r#"
+[site]
+title = "Docs"
+base_path = ""
+
+[[section]]
+title = "Guides"
+index_path = "/guides/"
+
+[[section.page]]
+title = "Guides"
+source = "guides.md"
+path = "/guides/"
+"#;
+        let nav = parse_nav(input).expect("index_path should be accepted");
+        assert_eq!(nav.sections[0].index_path.as_deref(), Some("/guides/"));
+    }
+
+    #[test]
+    fn section_index_path_is_optional() {
+        let nav = parse_nav(SAMPLE).expect("valid nav.toml should parse");
+        assert_eq!(nav.sections[0].index_path, None);
+    }
+
+    #[test]
+    fn index_path_duplicating_a_page_path_does_not_trigger_duplicate_path() {
+        // 実 `site/nav.toml` は `index_path` がそのセクションの `page.path` と
+        // 意図的に一致する（例: `/guides/`）。dedup 対象は `page.path` のみで
+        // あるべき回帰テスト。
+        let input = r#"
+[site]
+title = "Docs"
+base_path = ""
+
+[[section]]
+title = "Guides"
+index_path = "/guides/"
+
+[[section.page]]
+title = "Guides"
+source = "guides.md"
+path = "/guides/"
+"#;
+        assert!(parse_nav(input).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_index_path_format() {
+        let input = r#"
+[site]
+title = "Docs"
+base_path = ""
+
+[[section]]
+title = "Guides"
+index_path = "guides"
+
+[[section.page]]
+title = "Guides"
+source = "guides.md"
+path = "/guides/"
+"#;
+        assert!(matches!(
+            parse_nav(input),
+            Err(NavError::InvalidIndexPath(_))
+        ));
     }
 
     #[test]
