@@ -1136,6 +1136,28 @@ impl BackendOps for CpuBackendOps {
         elementwise::tanh(a).map_err(BackendError::ShapeMismatch)
     }
 
+    /// `BackendOps::where_cond` の CPU 実装（イシュー #1637）。
+    /// `elementwise::where_cond`（`PARALLEL_THRESHOLD` による rayon
+    /// 自動並列化）へ委譲する（`add`／`mul` と同じ位置づけ）。
+    fn where_cond(
+        &self,
+        cond: &Tensor<f32>,
+        a: &Tensor<f32>,
+        b: &Tensor<f32>,
+    ) -> Result<Tensor<f32>, BackendError> {
+        elementwise::where_cond(cond, a, b).map_err(BackendError::ShapeMismatch)
+    }
+
+    /// `BackendOps::masked_fill` の CPU 実装（イシュー #1637）。
+    fn masked_fill(
+        &self,
+        x: &Tensor<f32>,
+        mask: &Tensor<f32>,
+        value: f32,
+    ) -> Result<Tensor<f32>, BackendError> {
+        elementwise::masked_fill(x, mask, value).map_err(BackendError::ShapeMismatch)
+    }
+
     fn sum(&self, a: &Tensor<f32>, dim: Option<usize>) -> Result<Tensor<f32>, BackendError> {
         reduction::sum(a, dim).map_err(reduce_error_to_backend_error)
     }

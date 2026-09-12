@@ -699,6 +699,105 @@ impl CudaBackendOps {
         Tensor::new(out, &out_shape).map_err(BackendError::ShapeMismatch)
     }
 
+    /// 3 項 elementwise 共通のディスパッチ（`where_cond`。イシュー
+    /// #1637）。[`Self::elementwise_binary`] と異なり broadcast は
+    /// 行わない（`BackendOps::where_cond` doc の契約どおり、`cond`／
+    /// `a`／`b` は呼び出し元〈`Var::where_cond`〉が同一 `out_shape` へ
+    /// 実体化済みで渡す前提。ここでは形状一致を再検査するのみ・
+    /// `.claude/rules/security.md` A08）。
+    fn elementwise_ternary(
+        &self,
+        cond: &Tensor<f32>,
+        a: &Tensor<f32>,
+        b: &Tensor<f32>,
+        run: impl FnOnce(&CudaElementwise, &[f32], &[f32], &[f32]) -> Result<Vec<f32>, CudaError>,
+    ) -> Result<Tensor<f32>, BackendError> {
+        let out_shape = a.shape().to_vec();
+        if cond.shape() != out_shape.as_slice() {
+            return Err(BackendError::ShapeMismatch(ShapeError::ShapeMismatch {
+                lhs: cond.shape().to_vec(),
+                rhs: out_shape,
+            }));
+        }
+        if b.shape() != out_shape.as_slice() {
+            return Err(BackendError::ShapeMismatch(ShapeError::ShapeMismatch {
+                lhs: b.shape().to_vec(),
+                rhs: out_shape,
+            }));
+        }
+
+        let cond_owned = cond.contiguous();
+        let a_owned = a.contiguous();
+        let b_owned = b.contiguous();
+        let cond_slice = cond_owned.as_slice().ok_or_else(|| {
+            BackendError::KernelLaunchFailed("elementwise: cond not contiguous".into())
+        })?;
+        let a_slice = a_owned.as_slice().ok_or_else(|| {
+            BackendError::KernelLaunchFailed("elementwise: lhs not contiguous".into())
+        })?;
+        let b_slice = b_owned.as_slice().ok_or_else(|| {
+            BackendError::KernelLaunchFailed("elementwise: rhs not contiguous".into())
+        })?;
+
+        let ew = self.with_driver_call(
+            &[],
+            |e| BackendError::CudaUnavailable(e.to_string()),
+            || {
+                let device = self.device_handle_raw()?;
+                context_cache::cached_elementwise(&device)
+            },
+        )?;
+        let out = self.with_driver_call(
+            &[],
+            |e| BackendError::KernelLaunchFailed(e.to_string()),
+            || run(&ew, cond_slice, a_slice, b_slice),
+        )?;
+        Tensor::new(out, &out_shape).map_err(BackendError::ShapeMismatch)
+    }
+
+    /// 二項＋スカラー elementwise 共通のディスパッチ（`masked_fill`。
+    /// イシュー #1637）。broadcast は行わない（`BackendOps::
+    /// masked_fill` doc の契約どおり `mask` は `x` と同一 shape）。
+    fn elementwise_binary_scalar(
+        &self,
+        x: &Tensor<f32>,
+        mask: &Tensor<f32>,
+        value: f32,
+        run: impl FnOnce(&CudaElementwise, &[f32], &[f32], f32) -> Result<Vec<f32>, CudaError>,
+    ) -> Result<Tensor<f32>, BackendError> {
+        let out_shape = x.shape().to_vec();
+        if mask.shape() != out_shape.as_slice() {
+            return Err(BackendError::ShapeMismatch(ShapeError::ShapeMismatch {
+                lhs: mask.shape().to_vec(),
+                rhs: out_shape,
+            }));
+        }
+
+        let x_owned = x.contiguous();
+        let mask_owned = mask.contiguous();
+        let x_slice = x_owned.as_slice().ok_or_else(|| {
+            BackendError::KernelLaunchFailed("elementwise: lhs not contiguous".into())
+        })?;
+        let mask_slice = mask_owned.as_slice().ok_or_else(|| {
+            BackendError::KernelLaunchFailed("elementwise: mask not contiguous".into())
+        })?;
+
+        let ew = self.with_driver_call(
+            &[],
+            |e| BackendError::CudaUnavailable(e.to_string()),
+            || {
+                let device = self.device_handle_raw()?;
+                context_cache::cached_elementwise(&device)
+            },
+        )?;
+        let out = self.with_driver_call(
+            &[],
+            |e| BackendError::KernelLaunchFailed(e.to_string()),
+            || run(&ew, x_slice, mask_slice, value),
+        )?;
+        Tensor::new(out, &out_shape).map_err(BackendError::ShapeMismatch)
+    }
+
     /// 単項 elementwise 共通のディスパッチ（`relu`／`exp`／`tanh`）。
     /// ブロードキャストが発生しない点を除き [`Self::elementwise_binary`]
     /// と同一構造。
@@ -2441,6 +2540,31 @@ impl BackendOps for CudaBackendOps {
 
     fn mul(&self, a: &Tensor<f32>, b: &Tensor<f32>) -> Result<Tensor<f32>, BackendError> {
         self.elementwise_binary(a, b, |ew, a_s, b_s| ew.run_mul_f32(a_s, b_s))
+    }
+
+    /// `BackendOps::where_cond` の CUDA 実装（イシュー #1637）。
+    /// `elementwise::CudaElementwise::run_where_f32` へ委譲する。
+    fn where_cond(
+        &self,
+        cond: &Tensor<f32>,
+        a: &Tensor<f32>,
+        b: &Tensor<f32>,
+    ) -> Result<Tensor<f32>, BackendError> {
+        self.elementwise_ternary(cond, a, b, |ew, cond_s, a_s, b_s| {
+            ew.run_where_f32(cond_s, a_s, b_s)
+        })
+    }
+
+    /// `BackendOps::masked_fill` の CUDA 実装（イシュー #1637）。
+    fn masked_fill(
+        &self,
+        x: &Tensor<f32>,
+        mask: &Tensor<f32>,
+        value: f32,
+    ) -> Result<Tensor<f32>, BackendError> {
+        self.elementwise_binary_scalar(x, mask, value, |ew, x_s, mask_s, v| {
+            ew.run_masked_fill_f32(x_s, mask_s, v)
+        })
     }
 
     fn relu(&self, a: &Tensor<f32>) -> Result<Tensor<f32>, BackendError> {

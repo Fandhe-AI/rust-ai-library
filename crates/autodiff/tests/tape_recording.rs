@@ -754,3 +754,35 @@ fn cat_stack_narrow_split_chunk_error_paths() {
         AutodiffError::InvalidArgument(_)
     ));
 }
+/// 30. `where_cond`／`masked_fill`（イシュー #1637）が 1 ノードのみ
+///     追加する `push_eager`（実体化済み）ノードとして記録される
+///     ことを検証する（`Op::Concat`／`Op::Softmax` と同型。view ノード
+///     ではない）。
+#[test]
+fn where_and_masked_fill_record_single_eager_node() {
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let a = tape.var(&t(vec![1.0, 2.0, 3.0, 4.0], &[4]));
+    let b = tape.var(&t(vec![10.0, 20.0, 30.0, 40.0], &[4]));
+    let cond = Tensor::new(vec![true, false, true, false], &[4])
+        .expect("test fixture: shape とデータ長は事前に一致させている");
+
+    let before = tape.len();
+    let out = fandhe_ai_autodiff::Var::where_cond(&cond, &a, &b).unwrap();
+    assert_eq!(
+        tape.len(),
+        before + 1,
+        "where_cond は 1 ノードのみ追加するはず"
+    );
+    assert_eq!(out.to_tensor().shape(), &[4]);
+
+    let before2 = tape.len();
+    let mask = Tensor::new(vec![true, false, true, false], &[4])
+        .expect("test fixture: shape とデータ長は事前に一致させている");
+    let filled = a.masked_fill(&mask, -1.0).unwrap();
+    assert_eq!(
+        tape.len(),
+        before2 + 1,
+        "masked_fill は 1 ノードのみ追加するはず"
+    );
+    assert_eq!(filled.to_tensor().shape(), &[4]);
+}

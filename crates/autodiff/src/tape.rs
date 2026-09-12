@@ -479,6 +479,40 @@ pub(crate) enum Op {
     /// log_softmax` doc「`ln(softmax(x))` にしない理由」参照）ため
     /// `Softmax` とは別 variant とする。
     LogSoftmax { input: NodeId, dim: usize },
+    /// 条件テンソルによる要素選択（`Var::where_cond`。`torch.where`
+    /// 相当。イシュー #1637）。`cond` は `a`／`b` と同じ `out_shape`
+    /// へ broadcast 済みの f32 マスク（[`fandhe_ai_tensor_core::
+    /// BackendOps::where_cond`] と同じ `c != 0.0` 判定契約）として
+    /// forward 時点（`Var::where_cond`）で 1 回だけ実体化し、以後
+    /// 再計算しない（`Op::LstmHidden` が `gate_o` を保持する先例と
+    /// 同型）。`BackendOps::where_cond` に対応メソッドがあり
+    /// （`Softmax`／`Concat` と同様）非融合対象——`Op::
+    /// is_lazy_elementwise` の elementwise 5 演算には含めない・
+    /// `push_eager` で常に実体化する。
+    ///
+    /// VJP（`grad.rs`）: `da = mask_keep(g, cond, |c| c != 0.0)` を
+    /// `a.shape` へ縮約・`db = mask_keep(g, cond, |c| c == 0.0)` を
+    /// `b.shape` へ縮約する（`Op::Mul` と同じ broadcast 逆演算
+    /// `reduce_to_shape`）。
+    Where {
+        cond: Tensor<f32>,
+        a: NodeId,
+        b: NodeId,
+    },
+    /// マスク位置を定数で置換する（`Var::masked_fill`。`torch.
+    /// masked_fill` 相当。イシュー #1637）。`mask` は `input` と同じ
+    /// shape へ broadcast 済みの f32 マスク（[`Op::Where`] と同じ
+    /// 実体化・判定契約）。置換定数（`value`）は forward が
+    /// 計算済みの `TapeNode::value`（置換後の出力）に焼き込まれる
+    /// ため、backward に不要な定数を `Op` へ二重保持しない
+    /// （`Op::Softmax`／`Op::LogSoftmax` が `dim` 以外の中間値を
+    /// 持たないのと同じ最小保持方針）。`BackendOps::masked_fill` に
+    /// 対応メソッドがあるため非融合対象（`push_eager` で常に実体化）。
+    ///
+    /// VJP（`grad.rs`）: `d_input = mask_keep(g, mask, |m| m == 0.0)`
+    /// （fill 位置の勾配は 0。broadcast なし・shape 不変のため縮約は
+    /// 不要）。
+    MaskedFill { input: NodeId, mask: Tensor<f32> },
 }
 
 /// [`Op::LinearResident`] の VJP（`grad.rs`）が `weight`／`bias` の

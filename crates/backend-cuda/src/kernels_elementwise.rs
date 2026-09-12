@@ -127,3 +127,40 @@ extern "C" __global__ void ew_tanh_f32(
     }
 }
 "#;
+
+/// 条件テンソルによる要素選択（`torch.where` 相当。イシュー #1637）。
+/// 真偽判定は `c != 0.0f`（`backend-cpu::elementwise::where_slice` と
+/// 同一契約。比較のみで libm 非経由）。3 入力とも同長（ブロードキャスト
+/// 非対応。呼び出し元が事前に同一 shape へ実体化する契約は本モジュール
+/// 冒頭の「ブロードキャスト」節と同じ）。
+pub const EW_WHERE_F32: &str = r#"
+extern "C" __global__ void ew_where_f32(
+    const float* __restrict__ cond,
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int numel)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numel) {
+        out[idx] = (cond[idx] != 0.0f) ? a[idx] : b[idx];
+    }
+}
+"#;
+
+/// マスク位置を定数で置換する（`torch.masked_fill` 相当。イシュー
+/// #1637）。真偽判定は `m != 0.0f`（`where_slice` と同一契約）。
+pub const EW_MASKED_FILL_F32: &str = r#"
+extern "C" __global__ void ew_masked_fill_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ mask,
+    float value,
+    float* __restrict__ out,
+    int numel)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < numel) {
+        out[idx] = (mask[idx] != 0.0f) ? value : x[idx];
+    }
+}
+"#;

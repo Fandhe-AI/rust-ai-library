@@ -52,6 +52,24 @@ pub(crate) fn validate_elementwise_binary_dims(
     validate_elementwise_len(a_len)
 }
 
+/// `cond_len`／`a_len`／`b_len` が全て一致し、かつ `i32::MAX` に収まる
+/// ことを検証する（3 入力演算〈`where_cond`〉向け。イシュー #1637）。
+/// `validate_elementwise_binary_dims` の 3 項版。
+pub(crate) fn validate_elementwise_ternary_dims(
+    cond_len: usize,
+    a_len: usize,
+    b_len: usize,
+) -> Result<(), CudaError> {
+    if cond_len != a_len || cond_len != b_len {
+        return Err(CudaError::InvalidElementwiseShape {
+            detail: format!(
+                "elementwise length mismatch: cond_len={cond_len}, a_len={a_len}, b_len={b_len}"
+            ),
+        });
+    }
+    validate_elementwise_len(cond_len)
+}
+
 /// 単項演算向け: 長さが `i32::MAX` に収まることのみを検証する。
 pub(crate) fn validate_elementwise_len(len: usize) -> Result<(), CudaError> {
     if len > i32::MAX as usize {
@@ -100,6 +118,11 @@ pub struct CudaElementwise {
     relu_f32: CudaFunction,
     exp_f32: CudaFunction,
     tanh_f32: CudaFunction,
+    /// `torch.where` 相当（イシュー #1637）。`add_f32` 等と同じ NVRTC
+    /// コンパイル済みハンドルを `new` 時に一括保持する。
+    where_f32: CudaFunction,
+    /// `torch.masked_fill` 相当（イシュー #1637）。
+    masked_fill_f32: CudaFunction,
 }
 
 impl CudaElementwise {
@@ -123,6 +146,8 @@ impl CudaElementwise {
         let relu_ptx = compile_ptx(kernels_elementwise::EW_RELU_F32, arch)?;
         let exp_ptx = compile_ptx(kernels_elementwise::EW_EXP_F32, arch)?;
         let tanh_ptx = compile_ptx(kernels_elementwise::EW_TANH_F32, arch)?;
+        let where_ptx = compile_ptx(kernels_elementwise::EW_WHERE_F32, arch)?;
+        let masked_fill_ptx = compile_ptx(kernels_elementwise::EW_MASKED_FILL_F32, arch)?;
 
         let add_f32 = device
             .context()
@@ -144,6 +169,14 @@ impl CudaElementwise {
             .context()
             .load_module(tanh_ptx)?
             .load_function("ew_tanh_f32")?;
+        let where_f32 = device
+            .context()
+            .load_module(where_ptx)?
+            .load_function("ew_where_f32")?;
+        let masked_fill_f32 = device
+            .context()
+            .load_module(masked_fill_ptx)?
+            .load_function("ew_masked_fill_f32")?;
 
         let allocator = context_cache::cached_allocator(device)?;
 
@@ -156,6 +189,8 @@ impl CudaElementwise {
             relu_f32,
             exp_f32,
             tanh_f32,
+            where_f32,
+            masked_fill_f32,
         })
     }
 
@@ -235,6 +270,104 @@ impl CudaElementwise {
             // ため、論理長ビュー（`as_view()`）を渡す。
             crate::memory::readback(&self.stream, &out_dev.as_view())
         })
+    }
+
+    /// 3 項演算共通の起動手続き（`where_cond` 専用。イシュー #1637）。
+    /// [`Self::run_binary`] と同一構造で入力が 1 本増えただけ。
+    fn run_ternary(
+        &self,
+        func: &CudaFunction,
+        cond: &[f32],
+        a: &[f32],
+        b: &[f32],
+    ) -> Result<Vec<f32>, CudaError> {
+        validate_elementwise_ternary_dims(cond.len(), a.len(), b.len())?;
+        let numel = cond.len();
+        if numel == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.with_driver_call(|| {
+            let cond_dev = self.stream.clone_htod(cond)?;
+            let a_dev = self.stream.clone_htod(a)?;
+            let b_dev = self.stream.clone_htod(b)?;
+            let mut out_dev = self.allocator.alloc_uninit_f32(numel)?;
+
+            let cfg = elementwise_launch_config(numel as u32);
+            let numel_i = numel as i32;
+
+            // SAFETY: run_binary と同一の根拠（デバイスバッファ長は
+            // numel と 1:1 対応・カーネル内 `if (idx < numel)` 境界検査。
+            // REQ-8）。
+            unsafe {
+                self.stream
+                    .launch_builder(func)
+                    .arg(&cond_dev)
+                    .arg(&a_dev)
+                    .arg(&b_dev)
+                    .arg(&mut out_dev.as_view_mut())
+                    .arg(&numel_i)
+                    .launch(cfg)?;
+            }
+            crate::memory::readback(&self.stream, &out_dev.as_view())
+        })
+    }
+
+    /// 二項＋スカラー演算共通の起動手続き（`masked_fill` 専用。イシュー
+    /// #1637）。`value`（`f32` スカラー）はカーネル引数として `x`／
+    /// `mask` の後・`out` の前に渡す（`kernels_elementwise::
+    /// EW_MASKED_FILL_F32` の引数順と一致させる）。
+    fn run_binary_scalar(
+        &self,
+        func: &CudaFunction,
+        x: &[f32],
+        mask: &[f32],
+        value: f32,
+    ) -> Result<Vec<f32>, CudaError> {
+        validate_elementwise_binary_dims(x.len(), mask.len())?;
+        let numel = x.len();
+        if numel == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.with_driver_call(|| {
+            let x_dev = self.stream.clone_htod(x)?;
+            let mask_dev = self.stream.clone_htod(mask)?;
+            let mut out_dev = self.allocator.alloc_uninit_f32(numel)?;
+
+            let cfg = elementwise_launch_config(numel as u32);
+            let numel_i = numel as i32;
+
+            // SAFETY: run_binary と同一の根拠。
+            unsafe {
+                self.stream
+                    .launch_builder(func)
+                    .arg(&x_dev)
+                    .arg(&mask_dev)
+                    .arg(&value)
+                    .arg(&mut out_dev.as_view_mut())
+                    .arg(&numel_i)
+                    .launch(cfg)?;
+            }
+            crate::memory::readback(&self.stream, &out_dev.as_view())
+        })
+    }
+
+    /// 条件テンソルによる要素選択（`torch.where` 相当。イシュー #1637）。
+    /// `cond`／`a`／`b` は同一長であること。
+    pub fn run_where_f32(&self, cond: &[f32], a: &[f32], b: &[f32]) -> Result<Vec<f32>, CudaError> {
+        self.run_ternary(&self.where_f32, cond, a, b)
+    }
+
+    /// マスク位置を定数で置換する（`torch.masked_fill` 相当。イシュー
+    /// #1637）。`x`／`mask` は同一長であること。
+    pub fn run_masked_fill_f32(
+        &self,
+        x: &[f32],
+        mask: &[f32],
+        value: f32,
+    ) -> Result<Vec<f32>, CudaError> {
+        self.run_binary_scalar(&self.masked_fill_f32, x, mask, value)
     }
 
     /// 単項演算共通の起動手続き。[`Self::run_binary`] と同一構造。
@@ -457,5 +590,22 @@ mod tests {
     #[test]
     fn validate_elementwise_len_accepts_i32_max() {
         assert!(validate_elementwise_len(i32::MAX as usize).is_ok());
+    }
+
+    #[test]
+    fn validate_elementwise_ternary_dims_accepts_matching_lengths() {
+        assert!(validate_elementwise_ternary_dims(4, 4, 4).is_ok());
+    }
+
+    #[test]
+    fn validate_elementwise_ternary_dims_rejects_cond_mismatch() {
+        let err = validate_elementwise_ternary_dims(4, 4, 5).unwrap_err();
+        assert!(matches!(err, CudaError::InvalidElementwiseShape { .. }));
+    }
+
+    #[test]
+    fn validate_elementwise_ternary_dims_rejects_a_mismatch() {
+        let err = validate_elementwise_ternary_dims(4, 5, 4).unwrap_err();
+        assert!(matches!(err, CudaError::InvalidElementwiseShape { .. }));
     }
 }

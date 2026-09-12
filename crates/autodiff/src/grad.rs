@@ -1103,8 +1103,49 @@ pub(crate) fn vjp(
             let da = concat_with_fallback(ops, &pieces, dim, &input_shape)?;
             vec![(input, da)]
         }
+        // `Var::where_cond` が記録するノード（イシュー #1637）。
+        // `cond` は forward 時点で実体化済みの f32 マスク
+        // （`out_shape` ちょうど）を Op が保持する。本体は
+        // [`where_vjp`]（単体テストから直接呼べるよう分離。
+        // `matmul_vjp` と同じ切り出し方針）。
+        Op::Where { cond, a, b } => {
+            let a_shape = nodes[a.0].shape.clone();
+            let b_shape = nodes[b.0].shape.clone();
+            let (da, db) = where_vjp(&cond, upstream, &a_shape, &b_shape);
+            vec![(a, da), (b, db)]
+        }
+        // `Var::masked_fill` が記録するノード（イシュー #1637）。
+        // 本体は [`masked_fill_vjp`]。
+        Op::MaskedFill { input, mask } => {
+            let d_input = masked_fill_vjp(&mask, upstream);
+            vec![(input, d_input)]
+        }
     };
     Ok(contributions)
+}
+
+/// [`Op::Where`] の VJP 本体（イシュー #1637）。`cond` は `out_shape`
+/// ちょうど（forward 時点で broadcast 済み）の f32 マスク。`Op::Mul`
+/// と同じ「まず out_shape で計算してから `reduce_to_shape` で入力
+/// shape へ縮約する」契約に従う: `da = reduce(mask_keep(g, cond, c !=
+/// 0.0), a_shape)`・`db = reduce(mask_keep(g, cond, c == 0.0),
+/// b_shape)`。
+fn where_vjp(
+    cond: &Tensor<f32>,
+    upstream: &Tensor<f32>,
+    a_shape: &[usize],
+    b_shape: &[usize],
+) -> (Tensor<f32>, Tensor<f32>) {
+    let da = elementwise_mul_mask(upstream, cond, |c| c != 0.0);
+    let db = elementwise_mul_mask(upstream, cond, |c| c == 0.0);
+    (reduce_to_shape(&da, a_shape), reduce_to_shape(&db, b_shape))
+}
+
+/// [`Op::MaskedFill`] の VJP 本体（イシュー #1637）。fill 位置
+/// （`mask != 0.0`）の勾配は 0。`mask` は `input` と同 shape のため
+/// broadcast 縮約は不要（`Op::Relu` の VJP と同型）。
+fn masked_fill_vjp(mask: &Tensor<f32>, upstream: &Tensor<f32>) -> Tensor<f32> {
+    elementwise_mul_mask(upstream, mask, |m| m == 0.0)
 }
 
 /// [`Op::Concat`] の forward（`Var::cat`）と [`Op::Narrow`] の VJP
@@ -1136,6 +1177,63 @@ pub(crate) fn concat_with_fallback(
             Ok(v)
         }
         Err(BackendError::Unsupported(_)) => Ok(eval::concat(inputs, dim, out_shape)),
+        Err(other) => Err(AutodiffError::Backend(other)),
+    }
+}
+
+/// [`Op::Where`] の forward（`Var::where_cond`）が使う
+/// 「バックエンド実装 → フォールバック」ヘルパー（イシュー #1637）。
+/// [`concat_with_fallback`] と同型: `ops.where_cond` →
+/// `Unsupported` のときのみ `eval::where_cond` へフォールバックし、
+/// それ以外のエラーは伝播する（判定迂回経路を作らない）。バックエンド
+/// 実装が返した出力 shape を `out_shape` と照合し、不一致は
+/// `AutodiffError::Backend(BackendError::ShapeMismatch(..))` を返す。
+pub(crate) fn where_cond_with_fallback(
+    ops: &dyn BackendOps,
+    cond: &Tensor<f32>,
+    a: &Tensor<f32>,
+    b: &Tensor<f32>,
+    out_shape: &[usize],
+) -> Result<Tensor<f32>, AutodiffError> {
+    match ops.where_cond(cond, a, b) {
+        Ok(v) => {
+            if v.shape() != out_shape {
+                return Err(AutodiffError::Backend(BackendError::ShapeMismatch(
+                    ShapeError::ShapeMismatch {
+                        lhs: v.shape().to_vec(),
+                        rhs: out_shape.to_vec(),
+                    },
+                )));
+            }
+            Ok(v)
+        }
+        Err(BackendError::Unsupported(_)) => Ok(eval::where_cond(cond, a, b, out_shape)),
+        Err(other) => Err(AutodiffError::Backend(other)),
+    }
+}
+
+/// [`Op::MaskedFill`] の forward（`Var::masked_fill`）が使う
+/// 「バックエンド実装 → フォールバック」ヘルパー（イシュー #1637）。
+/// [`where_cond_with_fallback`] と同型。出力 shape は `x` と恒等。
+pub(crate) fn masked_fill_with_fallback(
+    ops: &dyn BackendOps,
+    x: &Tensor<f32>,
+    mask: &Tensor<f32>,
+    value: f32,
+) -> Result<Tensor<f32>, AutodiffError> {
+    match ops.masked_fill(x, mask, value) {
+        Ok(v) => {
+            if v.shape() != x.shape() {
+                return Err(AutodiffError::Backend(BackendError::ShapeMismatch(
+                    ShapeError::ShapeMismatch {
+                        lhs: v.shape().to_vec(),
+                        rhs: x.shape().to_vec(),
+                    },
+                )));
+            }
+            Ok(v)
+        }
+        Err(BackendError::Unsupported(_)) => Ok(eval::masked_fill(x, mask, value)),
         Err(other) => Err(AutodiffError::Backend(other)),
     }
 }
@@ -4558,5 +4656,113 @@ release ビルドでも検知できるよう `assert!` を使う）"
             "cell 参照先の w_hh データを差し替えても dh_prev が変化しない: LstmHidden \
              の VJP が cell 経由の w_hh を実際に読んでいない疑いがある"
         );
+    }
+
+    // --- Where／MaskedFill（イシュー #1637） ---
+
+    /// `where_vjp` の解析勾配が数値微分と一致することを確認する
+    /// （同 shape・分岐反転なしの固定 `cond`）。`cond` 自体は摂動対象
+    /// 外（定数マスク）のため `numeric_grad_unary` をそのまま使える。
+    #[test]
+    fn where_grad_matches_numeric_same_shape() {
+        let cond = t(&[1.0, 0.0, 1.0, 0.0], &[2, 2]);
+        let a = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let b = t(&[10.0, 20.0, 30.0, 40.0], &[2, 2]);
+        let s = t(&[1.0, -0.5, 0.3, 2.0], &[2, 2]);
+
+        let g = s.clone();
+        let (da, db) = where_vjp(&cond, &g, &[2, 2], &[2, 2]);
+
+        let num_da = numeric_grad_unary(&a, &s, |x| eval::where_cond(&cond, x, &b, &[2, 2]));
+        let num_db = numeric_grad_unary(&b, &s, |x| eval::where_cond(&cond, &a, x, &[2, 2]));
+
+        assert_grad_close("where dA", &da, &num_da);
+        assert_grad_close("where dB", &db, &num_db);
+    }
+
+    /// broadcast（`a: [2,2]`, `b: [2]`）で `db` が行方向へ縮約される
+    /// ことを確認する（`Op::Mul` の broadcast VJP と同じ縮約契約）。
+    #[test]
+    fn where_grad_broadcast_reduces_to_input_shape() {
+        let cond = t(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
+        let g = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+
+        let (da, db) = where_vjp(&cond, &g, &[2, 2], &[2]);
+
+        assert_eq!(da.shape(), &[2, 2]);
+        assert_eq!(db.shape(), &[2]);
+        // da: cond!=0 の位置のみ g を通す。
+        assert_eq!(dense_vec(&da), vec![1.0, 0.0, 0.0, 4.0]);
+        // db: cond==0 の位置のみ g を通し、行方向（broadcast 元軸）で
+        // 合算する。cond=[[1,0],[0,1]]・g=[[1,2],[3,4]] より
+        // masked=[[0,2],[3,0]]・列ごとの和=[0+3, 2+0]=[3, 2]。
+        assert_eq!(dense_vec(&db), vec![3.0, 2.0]);
+    }
+
+    /// 同一 `Var` を `a`／`b` 両方に指定した場合（`where(c, x, x)`）、
+    /// `accumulate` が合算する前提のもと、`da + db == g`（全域で
+    /// upstream をそのまま通す）ことを確認する。
+    #[test]
+    fn where_grad_same_var_both_sides_sums_to_upstream() {
+        let cond = t(&[1.0, 0.0, 1.0, 0.0], &[2, 2]);
+        let g = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+
+        let (da, db) = where_vjp(&cond, &g, &[2, 2], &[2, 2]);
+        let sum: Vec<f32> = dense_vec(&da)
+            .iter()
+            .zip(dense_vec(&db).iter())
+            .map(|(&a, &b)| a + b)
+            .collect();
+        assert_eq!(sum, dense_vec(&g));
+    }
+
+    /// NaN が非選択側に留まる（選択側の値・勾配へ伝播しない）ことを
+    /// 確認する。`cond` が `1.0` の位置では `b` 側に NaN があっても
+    /// forward 出力・`da` は NaN の影響を受けない。
+    #[test]
+    fn where_forward_and_grad_isolate_nan_to_unselected_side() {
+        let cond = t(&[1.0, 0.0], &[2]);
+        let a = t(&[1.0, 2.0], &[2]);
+        let b = t(&[f32::NAN, 20.0], &[2]);
+        let out_shape = [2usize];
+
+        let value = eval::where_cond(&cond, &a, &b, &out_shape);
+        assert_eq!(dense_vec(&value), vec![1.0, 20.0]);
+
+        let g = t(&[1.0, 1.0], &[2]);
+        let (da, db) = where_vjp(&cond, &g, &out_shape, &out_shape);
+        assert_eq!(dense_vec(&da), vec![1.0, 0.0]);
+        // db[0] は `cond[0] != 0.0` により 0 になるはず（NaN の位置は
+        // 選択されていないため upstream を通さない）。
+        assert_eq!(dense_vec(&db)[0], 0.0);
+        assert_eq!(dense_vec(&db)[1], 1.0);
+    }
+
+    /// `masked_fill_vjp` の解析勾配が数値微分と一致することを確認する
+    /// （fill 位置の勾配は 0、それ以外は upstream をそのまま通す）。
+    #[test]
+    fn masked_fill_grad_matches_numeric() {
+        let mask = t(&[1.0, 0.0, 1.0, 0.0], &[2, 2]);
+        let x = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+        let s = t(&[1.0, -0.5, 0.3, 2.0], &[2, 2]);
+        let value = -9.0f32;
+
+        let g = s.clone();
+        let dx = masked_fill_vjp(&mask, &g);
+
+        let num_dx = numeric_grad_unary(&x, &s, |t| eval::masked_fill(t, &mask, value));
+
+        assert_grad_close("masked_fill dX", &dx, &num_dx);
+    }
+
+    /// fill 位置の勾配が厳密に 0 であることを直接確認する。
+    #[test]
+    fn masked_fill_grad_zero_at_filled_positions() {
+        let mask = t(&[1.0, 0.0, 1.0, 0.0], &[2, 2]);
+        let g = t(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
+
+        let dx = masked_fill_vjp(&mask, &g);
+
+        assert_eq!(dense_vec(&dx), vec![0.0, 2.0, 0.0, 4.0]);
     }
 }

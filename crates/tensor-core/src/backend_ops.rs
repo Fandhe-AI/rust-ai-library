@@ -946,6 +946,64 @@ pub trait BackendOps {
         ))
     }
 
+    /// 条件テンソルによる要素選択（`torch.where` 相当。イシュー
+    /// #1637）。`cond` は `a`／`b` と同じ shape へ broadcast 済みの
+    /// **f32 マスク**として渡される（`Tensor<bool>` はデバイス転送
+    /// 契約〈`MemoryOps` は f32 専用〉の対象外のため、呼び出し元
+    /// `fandhe_ai_autodiff::var::Var::where_cond` が bool→f32 変換を
+    /// 1 回だけ行い `out_shape` ちょうどの contiguous テンソルへ
+    /// 実体化する）。真偽の判定契約は**3 バックエンド共通で
+    /// `c != 0.0`**（CPU `Rust c != 0.0`・CUDA `c != 0.0f`・Metal MSL
+    /// `c != 0.0f`。NaN マスクは呼び出し元で発生し得ないため考慮不要）。
+    /// `cond`／`a`／`b` は全て同一 shape（`out_shape`）であること。
+    /// 出力 shape は `a`（＝`b`＝`cond`）と恒等。
+    ///
+    /// # デフォルト実装
+    ///
+    /// [`Self::concat`] と同じ非破壊拡張・fail-safe。既定は
+    /// [`BackendError::Unsupported`] を返し、`Var::where_cond` は
+    /// `Unsupported` のときのみホスト参照実装（`eval::where_cond`）へ
+    /// フォールバックする（それ以外のエラーは伝播する。判定迂回経路を
+    /// 作らない。`.claude/rules/security.md` A08）。実装側でも
+    /// `cond`／`a`／`b` の shape を再検査し、不一致は
+    /// [`BackendError::ShapeMismatch`] を返すこと（fail-closed）。
+    fn where_cond(
+        &self,
+        _cond: &Tensor<f32>,
+        _a: &Tensor<f32>,
+        _b: &Tensor<f32>,
+    ) -> Result<Tensor<f32>, BackendError> {
+        Err(BackendError::Unsupported(
+            "where_cond: default fail-safe (no fused where kernel available)".into(),
+        ))
+    }
+
+    /// マスク位置を定数 `value` で置換する（`torch.masked_fill` 相当。
+    /// イシュー #1637）。`mask` は `x` と同じ shape へ broadcast 済みの
+    /// f32 マスク（[`Self::where_cond`] と同じ `c != 0.0` 判定契約・
+    /// bool→f32 変換の位置づけ）。`mask` の要素が真（`!= 0.0`）の位置を
+    /// `value` に置換し、それ以外は `x` の値をそのまま返す。出力 shape
+    /// は `x` と恒等。
+    ///
+    /// # デフォルト実装
+    ///
+    /// [`Self::where_cond`] と同じ非破壊拡張・fail-safe。既定は
+    /// [`BackendError::Unsupported`] を返し、`Var::masked_fill` は
+    /// `Unsupported` のときのみホスト参照実装（`eval::masked_fill`）へ
+    /// フォールバックする。実装側でも `x`／`mask` の shape 一致を
+    /// 再検査し、不一致は [`BackendError::ShapeMismatch`] を返すこと
+    /// （fail-closed）。
+    fn masked_fill(
+        &self,
+        _x: &Tensor<f32>,
+        _mask: &Tensor<f32>,
+        _value: f32,
+    ) -> Result<Tensor<f32>, BackendError> {
+        Err(BackendError::Unsupported(
+            "masked_fill: default fail-safe (no fused masked_fill kernel available)".into(),
+        ))
+    }
+
     /// GEMM の epilogue（bias 加算・activation）を融合した
     /// `act(A @ B + bias)` を計算する（TASK-12.1f・#203）。
     ///
@@ -2138,6 +2196,33 @@ mod tests {
         let b = Tensor::new(vec![3.0, 4.0], &[2]).unwrap();
 
         let result = ops.concat(&[&a, &b], 0);
+
+        assert!(matches!(result, Err(BackendError::Unsupported(_))));
+    }
+
+    /// [`BackendOps::where_cond`] の既定実装が fail-safe を返すことを
+    /// 確認する（イシュー #1637）。
+    #[test]
+    fn where_cond_default_is_unsupported() {
+        let ops = MockOps(Device::Cpu);
+        let cond = Tensor::new(vec![1.0, 0.0], &[2]).unwrap();
+        let a = Tensor::new(vec![1.0, 2.0], &[2]).unwrap();
+        let b = Tensor::new(vec![3.0, 4.0], &[2]).unwrap();
+
+        let result = ops.where_cond(&cond, &a, &b);
+
+        assert!(matches!(result, Err(BackendError::Unsupported(_))));
+    }
+
+    /// [`BackendOps::masked_fill`] の既定実装が fail-safe を返すことを
+    /// 確認する（イシュー #1637）。
+    #[test]
+    fn masked_fill_default_is_unsupported() {
+        let ops = MockOps(Device::Cpu);
+        let x = Tensor::new(vec![1.0, 2.0], &[2]).unwrap();
+        let mask = Tensor::new(vec![1.0, 0.0], &[2]).unwrap();
+
+        let result = ops.masked_fill(&x, &mask, -1.0);
 
         assert!(matches!(result, Err(BackendError::Unsupported(_))));
     }

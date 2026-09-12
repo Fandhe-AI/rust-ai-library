@@ -948,3 +948,175 @@ fn split_with_sizes_sum_mismatch_is_rejected() {
         AutodiffError::Shape(fandhe_ai_tensor_core::ShapeError::ShapeMismatch { .. })
     ));
 }
+// --- Where／MaskedFill（イシュー #1637） ---
+
+fn tb(data: Vec<bool>, shape: &[usize]) -> Tensor<bool> {
+    Tensor::new(data, shape).expect("test fixture: shape とデータ長は事前に一致させている")
+}
+
+/// ①forward 値（解析）: `where_cond` が `cond` の真偽で `a`／`b` の
+/// 要素を選択することを直接確認する。
+#[test]
+fn where_forward_selects_by_condition() {
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let a = tape.var(&t(vec![1.0, 2.0, 3.0, 4.0], &[4]));
+    let b = tape.var(&t(vec![10.0, 20.0, 30.0, 40.0], &[4]));
+    let cond = tb(vec![true, false, true, false], &[4]);
+    let out = fandhe_ai_autodiff::Var::where_cond(&cond, &a, &b).unwrap();
+    assert_eq!(dense_vec(&out.to_tensor()), vec![1.0, 20.0, 3.0, 40.0]);
+}
+
+/// ②`where_cond` の backward を中央差分と突合する（`cond` は摂動対象
+/// 外の定数マスク）。
+#[test]
+fn where_backward_matches_numeric() {
+    let cond = tb(vec![true, false, true, false], &[4]);
+    let a0 = t(vec![1.0, 2.0, 3.0, 4.0], &[4]);
+    let b0 = t(vec![10.0, 20.0, 30.0, 40.0], &[4]);
+
+    let forward = |a: &Tensor<f32>, b: &Tensor<f32>| -> f32 {
+        let tape = Tape::new_with_ops(common::naive_ops());
+        let av = tape.var(a);
+        let bv = tape.var(b);
+        let out = fandhe_ai_autodiff::Var::where_cond(&cond, &av, &bv).unwrap();
+        scalar(&out.sum(None).unwrap().to_tensor())
+    };
+
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let av = tape.var(&a0);
+    let bv = tape.var(&b0);
+    let out = fandhe_ai_autodiff::Var::where_cond(&cond, &av, &bv).unwrap();
+    let loss = out.sum(None).unwrap();
+    let grads = tape.backward(&loss).unwrap();
+    let da = grads.get(&av).unwrap().expect("a は loss に到達する");
+    let db = grads.get(&bv).unwrap().expect("b は loss に到達する");
+
+    let num_da = numeric_grad(&a0, |a| forward(&a, &b0));
+    let num_db = numeric_grad(&b0, |b| forward(&a0, &b));
+    assert_grad_close("where dA", da, &num_da);
+    assert_grad_close("where dB", db, &num_db);
+}
+
+/// ③broadcast（`x:[2,3]`, `y:[3]`, `cond:[2,3]`）で `dy` が行方向へ
+/// 縮約されることを確認する。
+#[test]
+fn where_backward_broadcast_reduces_dy_to_input_shape() {
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let x = tape.var(&t(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]));
+    let y = tape.var(&t(vec![10.0, 20.0, 30.0], &[3]));
+    let cond = tb(vec![true, false, true, false, true, false], &[2, 3]);
+    let out = fandhe_ai_autodiff::Var::where_cond(&cond, &x, &y).unwrap();
+    assert_eq!(out.to_tensor().shape(), &[2, 3]);
+    let loss = out.sum(None).unwrap();
+    let grads = tape.backward(&loss).unwrap();
+    let dy = grads.get(&y).unwrap().expect("y は loss に到達する");
+    assert_eq!(dy.shape(), &[3]);
+    // cond=[[T,F,T],[F,T,F]] → y が選ばれる位置は (0,1)・(1,0)・(1,2)。
+    // 各列で合算: col0 = row1(1) = 1.0・col1 = row0(1) = 1.0・
+    // col2 = row1(1) = 1.0（upstream は sum の勾配で全要素 1）。
+    assert_eq!(dense_vec(dy), vec![1.0, 1.0, 1.0]);
+}
+
+/// ④同一 `Var` を `a`／`b` 両方に指定した場合（`where(c, x, x)`）、
+/// `accumulate` が合算し `dx = g`（全要素 upstream をそのまま通す）
+/// ことを確認する。
+#[test]
+fn where_backward_same_var_both_sides_accumulates_to_upstream() {
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let x = tape.var(&t(vec![1.0, 2.0, 3.0, 4.0], &[4]));
+    let cond = tb(vec![true, false, true, false], &[4]);
+    let out = fandhe_ai_autodiff::Var::where_cond(&cond, &x, &x).unwrap();
+    assert_eq!(dense_vec(&out.to_tensor()), dense_vec(&x.to_tensor()));
+    let loss = out.sum(None).unwrap();
+    let grads = tape.backward(&loss).unwrap();
+    let dx = grads.get(&x).unwrap().expect("x は loss に到達する");
+    assert_eq!(dense_vec(dx), vec![1.0; 4]);
+}
+
+/// ⑤NaN が非選択側に留まることを確認する（forward 出力に NaN が
+/// 現れない）。
+#[test]
+fn where_forward_isolates_nan_to_unselected_side() {
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let a = tape.var(&t(vec![1.0, f32::NAN], &[2]));
+    let b = tape.var(&t(vec![f32::NAN, 20.0], &[2]));
+    let cond = tb(vec![true, false], &[2]);
+    let out = fandhe_ai_autodiff::Var::where_cond(&cond, &a, &b).unwrap();
+    let v = dense_vec(&out.to_tensor());
+    assert!(v[0].is_finite() && v[0] == 1.0);
+    assert!(v[1].is_finite() && v[1] == 20.0);
+}
+
+/// ⑥エラー経路: `cond` が `a`／`b` の broadcast 後 shape へ
+/// broadcast 不能なら `AutodiffError::Shape` を返す。
+#[test]
+fn where_cond_non_broadcastable_is_rejected() {
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let a = tape.var(&t(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]));
+    let b = tape.var(&t(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]));
+    let cond = tb(vec![true, false, true], &[3]);
+    let err = fandhe_ai_autodiff::Var::where_cond(&cond, &a, &b).unwrap_err();
+    assert!(matches!(err, AutodiffError::Shape(_)));
+}
+
+/// ⑥エラー経路: 異なるテープの `Var` を `where_cond` に渡すと
+/// `AutodiffError::TapeMismatch` を返す。
+#[test]
+fn where_cond_cross_tape_is_rejected() {
+    let tape_a = Tape::new_with_ops(common::naive_ops());
+    let tape_b = Tape::new_with_ops(common::naive_ops());
+    let a = tape_a.var(&t(vec![1.0, 2.0], &[2]));
+    let b = tape_b.var(&t(vec![3.0, 4.0], &[2]));
+    let cond = tb(vec![true, false], &[2]);
+    let err = fandhe_ai_autodiff::Var::where_cond(&cond, &a, &b).unwrap_err();
+    assert!(matches!(err, AutodiffError::TapeMismatch));
+}
+
+/// `masked_fill` の forward 値を確認する。
+#[test]
+fn masked_fill_forward_replaces_masked_positions() {
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let x = tape.var(&t(vec![1.0, 2.0, 3.0, 4.0], &[4]));
+    let mask = tb(vec![true, false, true, false], &[4]);
+    let out = x.masked_fill(&mask, -1.0).unwrap();
+    assert_eq!(dense_vec(&out.to_tensor()), vec![-1.0, 2.0, -1.0, 4.0]);
+}
+
+/// `masked_fill` の backward を中央差分と突合する（fill 位置の勾配は
+/// 0）。
+#[test]
+fn masked_fill_backward_matches_numeric() {
+    let mask = tb(vec![true, false, true, false], &[4]);
+    let x0 = t(vec![1.0, 2.0, 3.0, 4.0], &[4]);
+
+    let forward = |x: Tensor<f32>| -> f32 {
+        let tape = Tape::new_with_ops(common::naive_ops());
+        let xv = tape.var(&x);
+        let out = xv.masked_fill(&mask, -9.0).unwrap();
+        scalar(&out.sum(None).unwrap().to_tensor())
+    };
+
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let xv = tape.var(&x0);
+    let out = xv.masked_fill(&mask, -9.0).unwrap();
+    let loss = out.sum(None).unwrap();
+    let grads = tape.backward(&loss).unwrap();
+    let dx = grads.get(&xv).unwrap().expect("x は loss に到達する");
+
+    let num_dx = numeric_grad(&x0, forward);
+    assert_grad_close("masked_fill dX", dx, &num_dx);
+    // fill 位置の勾配は厳密に 0。
+    assert_eq!(dense_vec(dx)[0], 0.0);
+    assert_eq!(dense_vec(dx)[2], 0.0);
+}
+
+/// `masked_fill` のエラー経路: `mask` が `self` の shape へ
+/// broadcast 不能なら `AutodiffError::Shape` を返す。
+#[test]
+fn masked_fill_non_broadcastable_mask_is_rejected() {
+    let tape = Tape::new_with_ops(common::naive_ops());
+    let x = tape.var(&t(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]));
+    let mask = tb(vec![true, false, true], &[3]);
+    let err = x.masked_fill(&mask, 0.0).unwrap_err();
+    assert!(matches!(err, AutodiffError::Shape(_)));
+}

@@ -99,3 +99,36 @@ kernel void ew_tanh_f32(
         out[idx] = metal::precise::tanh(a[idx]);
     }
 }
+
+// 条件テンソルによる要素選択（`torch.where` 相当。イシュー #1637）。
+// 真偽判定は `c != 0.0f`（`backend-cpu::elementwise::where_slice`・CUDA
+// 側 `ew_where_f32` と同一契約。比較のみで libm 非経由）。3 入力とも
+// 同長（ブロードキャスト非対応。本ファイル冒頭「ブロードキャスト」
+// 節と同じ役割分担）。
+kernel void ew_where_f32(
+    device const float* cond [[buffer(0)]],
+    device const float* a [[buffer(1)]],
+    device const float* b [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& numel [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx < numel) {
+        out[idx] = (cond[idx] != 0.0f) ? a[idx] : b[idx];
+    }
+}
+
+// マスク位置を定数で置換する（`torch.masked_fill` 相当。イシュー
+// #1637）。真偽判定は `m != 0.0f`（`ew_where_f32` と同一契約）。
+kernel void ew_masked_fill_f32(
+    device const float* x [[buffer(0)]],
+    device const float* mask [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant float& value [[buffer(3)]],
+    constant uint& numel [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx < numel) {
+        out[idx] = (mask[idx] != 0.0f) ? value : x[idx];
+    }
+}

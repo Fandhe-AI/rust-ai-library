@@ -161,6 +161,65 @@ pub fn tanh_slice(a: &[f32], out: &mut [f32]) {
     }
 }
 
+/// 条件テンソルによる要素選択（`torch.where` 相当。イシュー #1637）。
+/// 真偽判定は `c != 0.0`（`BackendOps::where_cond` doc の契約と同一）。
+/// `cond`／`a`／`b` は同長であること（`Tensor` 入口 [`where_cond`]
+/// が shape 一致を検査済み）。
+pub fn where_slice(cond: &[f32], a: &[f32], b: &[f32], out: &mut [f32]) {
+    assert_eq!(
+        cond.len(),
+        a.len(),
+        "where_slice: length mismatch (cond vs a)"
+    );
+    assert_eq!(
+        cond.len(),
+        b.len(),
+        "where_slice: length mismatch (cond vs b)"
+    );
+    assert_eq!(
+        cond.len(),
+        out.len(),
+        "where_slice: length mismatch (cond vs out)"
+    );
+    if cond.len() >= PARALLEL_THRESHOLD {
+        out.par_iter_mut()
+            .zip(cond.par_iter())
+            .zip(a.par_iter())
+            .zip(b.par_iter())
+            .for_each(|(((o, &c), &av), &bv)| *o = if c != 0.0 { av } else { bv });
+    } else {
+        for (((o, &c), &av), &bv) in out.iter_mut().zip(cond).zip(a).zip(b) {
+            *o = if c != 0.0 { av } else { bv };
+        }
+    }
+}
+
+/// マスク位置を定数で置換する（`torch.masked_fill` 相当。イシュー
+/// #1637）。真偽判定は `m != 0.0`（`BackendOps::masked_fill` doc の
+/// 契約と同一）。`x`／`mask` は同長であること。
+pub fn masked_fill_slice(x: &[f32], mask: &[f32], value: f32, out: &mut [f32]) {
+    assert_eq!(
+        x.len(),
+        mask.len(),
+        "masked_fill_slice: length mismatch (x vs mask)"
+    );
+    assert_eq!(
+        x.len(),
+        out.len(),
+        "masked_fill_slice: length mismatch (x vs out)"
+    );
+    if x.len() >= PARALLEL_THRESHOLD {
+        out.par_iter_mut()
+            .zip(x.par_iter())
+            .zip(mask.par_iter())
+            .for_each(|((o, &xv), &mv)| *o = if mv != 0.0 { value } else { xv });
+    } else {
+        for ((o, &xv), &mv) in out.iter_mut().zip(x).zip(mask) {
+            *o = if mv != 0.0 { value } else { xv };
+        }
+    }
+}
+
 // --- ベンチ専用: 逐次／並列強制版（`#[cfg(test)]` 限定） ---
 //
 // `add_slice`／`mul_slice`／`exp_slice` は `PARALLEL_THRESHOLD` による
@@ -561,6 +620,90 @@ pub fn exp(a: &Tensor<f32>) -> Result<Tensor<f32>, ShapeError> {
 /// CPU 参照実装。
 pub fn tanh(a: &Tensor<f32>) -> Result<Tensor<f32>, ShapeError> {
     unary_elementwise(a, tanh_slice, f32::tanh)
+}
+
+/// 条件テンソルによる要素選択（`BackendOps::where_cond` に対応する
+/// CPU 参照実装。イシュー #1637）。呼び出し元（`Var::where_cond`）が
+/// `cond`／`a`／`b` を同一 `out_shape` へ broadcast 済みで渡す契約
+/// だが、実装側でも shape 一致を再検査する（`.claude/rules/
+/// security.md` A08。既存の `binary_elementwise` の strided 読み経路
+/// の 3 項化は本イシューでは行わず、非 contiguous 入力は
+/// `contiguous()` で実体化してから読む）。
+pub fn where_cond(
+    cond: &Tensor<f32>,
+    a: &Tensor<f32>,
+    b: &Tensor<f32>,
+) -> Result<Tensor<f32>, ShapeError> {
+    let out_shape = a.shape().to_vec();
+    if cond.shape() != out_shape.as_slice() {
+        return Err(ShapeError::ShapeMismatch {
+            lhs: cond.shape().to_vec(),
+            rhs: out_shape,
+        });
+    }
+    if b.shape() != out_shape.as_slice() {
+        return Err(ShapeError::ShapeMismatch {
+            lhs: b.shape().to_vec(),
+            rhs: out_shape,
+        });
+    }
+
+    if let (Some(cs), Some(as_), Some(bs)) = (cond.as_slice(), a.as_slice(), b.as_slice()) {
+        let mut out = vec![0.0f32; cs.len()];
+        where_slice(cs, as_, bs, &mut out);
+        return Tensor::new(out, &out_shape);
+    }
+
+    let cc = cond.contiguous();
+    let ac = a.contiguous();
+    let bcv = b.contiguous();
+    let cs = cc.as_slice().unwrap_or(&[]);
+    let as_ = ac.as_slice().unwrap_or(&[]);
+    let bs = bcv.as_slice().unwrap_or(&[]);
+    debug_assert_eq!(
+        cs.len(),
+        out_shape.iter().product::<usize>(),
+        "where_cond: contiguous() 直後は必ず as_slice を返すはず（契約違反）"
+    );
+    let mut out = vec![0.0f32; cs.len()];
+    where_slice(cs, as_, bs, &mut out);
+    Tensor::new(out, &out_shape)
+}
+
+/// マスク位置を定数で置換する（`BackendOps::masked_fill` に対応する
+/// CPU 参照実装。イシュー #1637）。`mask` は `x` と同一 shape へ
+/// broadcast 済み（呼び出し元契約）だが、実装側でも再検査する。
+pub fn masked_fill(
+    x: &Tensor<f32>,
+    mask: &Tensor<f32>,
+    value: f32,
+) -> Result<Tensor<f32>, ShapeError> {
+    let out_shape = x.shape().to_vec();
+    if mask.shape() != out_shape.as_slice() {
+        return Err(ShapeError::ShapeMismatch {
+            lhs: mask.shape().to_vec(),
+            rhs: out_shape,
+        });
+    }
+
+    if let (Some(xs), Some(ms)) = (x.as_slice(), mask.as_slice()) {
+        let mut out = vec![0.0f32; xs.len()];
+        masked_fill_slice(xs, ms, value, &mut out);
+        return Tensor::new(out, &out_shape);
+    }
+
+    let xc = x.contiguous();
+    let mc = mask.contiguous();
+    let xs = xc.as_slice().unwrap_or(&[]);
+    let ms = mc.as_slice().unwrap_or(&[]);
+    debug_assert_eq!(
+        xs.len(),
+        out_shape.iter().product::<usize>(),
+        "masked_fill: contiguous() 直後は必ず as_slice を返すはず（契約違反）"
+    );
+    let mut out = vec![0.0f32; xs.len()];
+    masked_fill_slice(xs, ms, value, &mut out);
+    Tensor::new(out, &out_shape)
 }
 
 #[cfg(test)]
@@ -1033,6 +1176,164 @@ mod tests {
             let out = add(&a, &b).unwrap();
             for i in 0..n {
                 assert_eq!(out.get(&[i]).unwrap(), av[i] + bv[i]);
+            }
+        }
+    }
+
+    // --- where_cond／masked_fill（イシュー #1637） ---
+
+    #[test]
+    fn where_slice_selects_by_condition() {
+        let cond = vec![1.0, 0.0, 1.0, 0.0];
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b = vec![10.0, 20.0, 30.0, 40.0];
+        let mut out = vec![0.0; 4];
+        where_slice(&cond, &a, &b, &mut out);
+        assert_eq!(out, vec![1.0, 20.0, 3.0, 40.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn where_slice_length_mismatch_panics() {
+        let cond = vec![1.0, 0.0];
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![1.0, 2.0];
+        let mut out = vec![0.0; 2];
+        where_slice(&cond, &a, &b, &mut out);
+    }
+
+    #[test]
+    fn where_slice_around_parallel_threshold_matches_scalar_expected() {
+        for n in [
+            PARALLEL_THRESHOLD - 1,
+            PARALLEL_THRESHOLD,
+            PARALLEL_THRESHOLD + 1,
+        ] {
+            let cond: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+            let a: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let b: Vec<f32> = (0..n).map(|i| -(i as f32)).collect();
+            let mut out = vec![0.0; n];
+            where_slice(&cond, &a, &b, &mut out);
+            for i in 0..n {
+                let expected = if cond[i] != 0.0 { a[i] } else { b[i] };
+                assert_eq!(out[i], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn masked_fill_slice_replaces_masked_positions() {
+        let x = vec![1.0, 2.0, 3.0, 4.0];
+        let mask = vec![1.0, 0.0, 1.0, 0.0];
+        let mut out = vec![0.0; 4];
+        masked_fill_slice(&x, &mask, -1.0, &mut out);
+        assert_eq!(out, vec![-1.0, 2.0, -1.0, 4.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn masked_fill_slice_length_mismatch_panics() {
+        let x = vec![1.0, 2.0, 3.0];
+        let mask = vec![1.0, 0.0];
+        let mut out = vec![0.0; 3];
+        masked_fill_slice(&x, &mask, 0.0, &mut out);
+    }
+
+    #[test]
+    fn masked_fill_slice_around_parallel_threshold_matches_scalar_expected() {
+        for n in [
+            PARALLEL_THRESHOLD - 1,
+            PARALLEL_THRESHOLD,
+            PARALLEL_THRESHOLD + 1,
+        ] {
+            let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let mask: Vec<f32> = (0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect();
+            let mut out = vec![0.0; n];
+            masked_fill_slice(&x, &mask, -9.0, &mut out);
+            for i in 0..n {
+                let expected = if mask[i] != 0.0 { -9.0 } else { x[i] };
+                assert_eq!(out[i], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn where_cond_tensor_entry_matches_slice() {
+        let cond = Tensor::<f32>::new(vec![1.0, 0.0, 1.0, 0.0], &[2, 2]).unwrap();
+        let a = Tensor::<f32>::new(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+        let b = Tensor::<f32>::new(vec![10.0, 20.0, 30.0, 40.0], &[2, 2]).unwrap();
+        let out = where_cond(&cond, &a, &b).unwrap();
+        assert_eq!(out.shape(), &[2, 2]);
+        for i in 0..4 {
+            let expected = if [1.0, 0.0, 1.0, 0.0][i] != 0.0 {
+                [1.0, 2.0, 3.0, 4.0][i]
+            } else {
+                [10.0, 20.0, 30.0, 40.0][i]
+            };
+            assert_eq!(out.get(&[i / 2, i % 2]).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn where_cond_shape_mismatch_returns_error() {
+        let cond = Tensor::<f32>::new(vec![1.0, 0.0], &[2]).unwrap();
+        let a = Tensor::<f32>::new(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+        let b = Tensor::<f32>::new(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+        let err = where_cond(&cond, &a, &b).unwrap_err();
+        assert!(matches!(err, ShapeError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn where_cond_with_non_contiguous_view_input_matches_contiguous() {
+        let a_base = Tensor::<f32>::new((0..6).map(|v| v as f32).collect(), &[2, 3]).unwrap();
+        let a_t = a_base.transpose(0, 1).unwrap(); // [3, 2], non-contiguous
+        let b = Tensor::<f32>::new(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[3, 2]).unwrap();
+        let cond = Tensor::<f32>::new(vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0], &[3, 2]).unwrap();
+        let out = where_cond(&cond, &a_t, &b).unwrap();
+        let a_t_contig = a_t.contiguous();
+        let out_contig = where_cond(&cond, &a_t_contig, &b).unwrap();
+        for i in 0..3 {
+            for j in 0..2 {
+                assert_eq!(out.get(&[i, j]).unwrap(), out_contig.get(&[i, j]).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn masked_fill_tensor_entry_matches_slice() {
+        let x = Tensor::<f32>::new(vec![1.0, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+        let mask = Tensor::<f32>::new(vec![1.0, 0.0, 1.0, 0.0], &[2, 2]).unwrap();
+        let out = masked_fill(&x, &mask, -1.0).unwrap();
+        assert_eq!(out.shape(), &[2, 2]);
+        for i in 0..4 {
+            let expected = if [1.0, 0.0, 1.0, 0.0][i] != 0.0 {
+                -1.0
+            } else {
+                [1.0, 2.0, 3.0, 4.0][i]
+            };
+            assert_eq!(out.get(&[i / 2, i % 2]).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn masked_fill_shape_mismatch_returns_error() {
+        let x = Tensor::<f32>::new(vec![1.0, 2.0, 3.0], &[3]).unwrap();
+        let mask = Tensor::<f32>::new(vec![1.0, 0.0], &[2]).unwrap();
+        let err = masked_fill(&x, &mask, 0.0).unwrap_err();
+        assert!(matches!(err, ShapeError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn masked_fill_with_non_contiguous_view_input_matches_contiguous() {
+        let x_base = Tensor::<f32>::new((0..6).map(|v| v as f32).collect(), &[2, 3]).unwrap();
+        let x_t = x_base.transpose(0, 1).unwrap(); // [3, 2], non-contiguous
+        let mask = Tensor::<f32>::new(vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0], &[3, 2]).unwrap();
+        let out = masked_fill(&x_t, &mask, -9.0).unwrap();
+        let x_t_contig = x_t.contiguous();
+        let out_contig = masked_fill(&x_t_contig, &mask, -9.0).unwrap();
+        for i in 0..3 {
+            for j in 0..2 {
+                assert_eq!(out.get(&[i, j]).unwrap(), out_contig.get(&[i, j]).unwrap());
             }
         }
     }

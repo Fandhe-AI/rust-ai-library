@@ -530,3 +530,40 @@ facade への到達経路は既存の `pub use fandhe_ai_autodiff::Var` 再エ�
 compat-api-scope.md` §5 の手続きは Tier 1 列挙済み機能につき再適用
 不要と判断）。
 
+## 追補（イシュー #1637）
+
+§2.2「`masked_select`/`where`」行（スナップショット時点の記述は不変の
+まま）を実装済み化した:
+
+- `Var::where_cond(cond: &Tensor<bool>, a: &Var, b: &Var)` — 新 Op
+  `Op::Where { cond: Tensor<f32>, a: NodeId, b: NodeId }`（コピーを伴う
+  `push_eager` ノード。`BackendOps::where_cond`〈既定 `Unsupported`〉→
+  `eval::where_cond` フォールバック）。`cond`（`&Tensor<bool>`）は
+  `Var::where_cond` が `out_shape`（`a`／`b` の broadcast 後 shape）へ
+  broadcast してから 1 回だけ f32 マスク（`{0.0, 1.0}`）へ変換し Op が
+  保持する（`MemoryOps` の f32 専用契約に合わせるため）。真偽判定は
+  3 バックエンド共通で `c != 0.0`。
+- `Var::masked_fill(&self, mask: &Tensor<bool>, value: f32)` — 新 Op
+  `Op::MaskedFill { input: NodeId, mask: Tensor<f32> }`（`value` は
+  forward が焼き込んだ `TapeNode::value` に含まれるため Op へ二重保持
+  しない）。`BackendOps::masked_fill`〈既定 `Unsupported`〉→ `eval::
+  masked_fill` フォールバック。
+- **CPU／CUDA／Metal の 3 バックエンドとも専用カーネルを実装**
+  （`backend-cpu::elementwise::{where_slice, masked_fill_slice}`・
+  CUDA `kernels_elementwise.rs::{EW_WHERE_F32, EW_MASKED_FILL_F32}`・
+  Metal `shaders/elementwise.metal::{ew_where_f32, ew_masked_fill_f32}`。
+  `#1598` の cat／narrow 系とは異なりホストフォールバックのみに留めて
+  いない）。選択演算は丸めを伴わないため 3 バックエンドとも bit 同一
+  になることを parity テスト（`crates/backend-cuda/tests/
+  where_masked_fill_parity.rs`・`crates/backend-metal/tests/
+  where_masked_fill_parity.rs`。Metal は M4 Max 実機実測完了・CUDA は
+  本エージェント実行環境に実機なしのため未実測明記）で確認した。
+- **VJP はホスト実装**（`Op::Relu` と同型。`grad::elementwise_mul_mask`
+  を再利用）。デバイス常駐 VJP（`binary_elementwise_device` 相当）は
+  本イシューのスコープ外。
+- facade への到達経路は既存の `pub use fandhe_ai_autodiff::Var` 再エク
+  スポートのみで、新規 `pub use`／`pub fn` は追加していない（`docs/
+  compat-api-scope.md` §1.2「index 系」行を参照。§5 の範囲拡張手続きは
+  Tier 1 列挙済み機能につき再適用不要と判断）。
+- gather／scatter／scatter_add／index_select（`docs/compat-api-scope.md`
+  §1.2「index 系」行の残対象）は #1638 へ引き継ぐ。

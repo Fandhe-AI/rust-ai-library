@@ -1553,6 +1553,125 @@ impl<'t> Var<'t> {
         let chunk_size = dim_size.div_ceil(chunks);
         self.split(chunk_size, dim)
     }
+
+    /// 条件テンソル `cond` で `a`／`b` を要素選択する（`torch.where`
+    /// 相当。イシュー #1637）。関連関数（`cond` が `Var` ではなく
+    /// `&Tensor<bool>` のため。`Var::cat` と同様の位置づけ）。
+    /// `#[doc(alias = "where")]` は Rust 予約語 `where` の代替名として
+    /// 検索性を確保する目的。
+    ///
+    /// 手順: ①`a.check_same_tape(b)` → ②`out_shape =
+    /// broadcast_shape(a.shape, b.shape)` → ③`cond` を `out_shape` へ
+    /// broadcast（不可なら `AutodiffError::Shape`）→ ④bool→f32 変換
+    /// （`out_shape` ちょうどの contiguous テンソルへ 1 回だけ実体化。
+    /// [`fandhe_ai_tensor_core::BackendOps::where_cond`] doc の f32
+    /// マスク契約）→ ⑤`a`／`b` を層 1 で実体化（`RefCell` 借用を
+    /// 閉じてから `push_eager` を呼ぶ規律。`Var::cat` と同型）→
+    /// ⑥`ops.where_cond` → `Unsupported` のときのみホスト参照実装
+    /// （`eval::where_cond`）へフォールバック → ⑦戻り shape 検証
+    /// （`.claude/rules/security.md` A08）→ ⑧`push_eager`。
+    #[doc(alias = "where")]
+    pub fn where_cond(
+        cond: &fandhe_ai_tensor_core::Tensor<bool>,
+        a: &Var<'t>,
+        b: &Var<'t>,
+    ) -> Result<Var<'t>, AutodiffError> {
+        a.check_same_tape(b)?;
+        let out_shape = broadcast_shape(&a.shape(), &b.shape()).map_err(AutodiffError::Shape)?;
+        let cond_bc = cond
+            .broadcast_to(&out_shape)
+            .map_err(AutodiffError::Shape)?
+            .contiguous();
+        let cond_mask: Vec<f32> = cond_bc
+            .as_slice()
+            .map(|s| s.iter().map(|&c| if c { 1.0 } else { 0.0 }).collect())
+            .unwrap_or_default();
+        let cond_f32 = eval::build_tensor(cond_mask, &out_shape);
+
+        let (a_val, b_val) = {
+            let nodes = a.tape.nodes.borrow();
+            let ops = a.tape.ops();
+            let a_val = materialize_fallible(&nodes, ops, a.id)?.clone();
+            let b_val = materialize_fallible(&nodes, ops, b.id)?.clone();
+            (a_val, b_val)
+        };
+        let a_bc = a_val
+            .broadcast_to(&out_shape)
+            .map_err(AutodiffError::Shape)?;
+        let b_bc = b_val
+            .broadcast_to(&out_shape)
+            .map_err(AutodiffError::Shape)?;
+
+        let value = crate::grad::where_cond_with_fallback(
+            a.tape.ops(),
+            &cond_f32,
+            &a_bc,
+            &b_bc,
+            &out_shape,
+        )?;
+        if value.shape() != out_shape {
+            return Err(AutodiffError::Backend(BackendError::ShapeMismatch(
+                ShapeError::ShapeMismatch {
+                    lhs: value.shape().to_vec(),
+                    rhs: out_shape.clone(),
+                },
+            )));
+        }
+        let id = a.tape.push_eager(
+            Op::Where {
+                cond: cond_f32,
+                a: a.id,
+                b: b.id,
+            },
+            value,
+        );
+        Ok(Var::from_raw(a.tape, id))
+    }
+
+    /// `mask` が真の位置を定数 `value` で置換する（`torch.masked_fill`
+    /// 相当。イシュー #1637）。メソッド（`self` を書き換えず新しい
+    /// `Var` を返す）。`mask` は `self` の shape へ broadcast 可能で
+    /// あること（`Var::where_cond` と同じ bool→f32 変換規律）。
+    pub fn masked_fill(
+        &self,
+        mask: &fandhe_ai_tensor_core::Tensor<bool>,
+        value: f32,
+    ) -> Result<Var<'t>, AutodiffError> {
+        let out_shape = self.shape();
+        let mask_bc = mask
+            .broadcast_to(&out_shape)
+            .map_err(AutodiffError::Shape)?
+            .contiguous();
+        let mask_data: Vec<f32> = mask_bc
+            .as_slice()
+            .map(|s| s.iter().map(|&m| if m { 1.0 } else { 0.0 }).collect())
+            .unwrap_or_default();
+        let mask_f32 = eval::build_tensor(mask_data, &out_shape);
+
+        let x_val = {
+            let nodes = self.tape.nodes.borrow();
+            materialize_fallible(&nodes, self.tape.ops(), self.id)?.clone()
+        };
+        let value_out =
+            crate::grad::masked_fill_with_fallback(self.tape.ops(), &x_val, &mask_f32, value)?;
+        if value_out.shape() != out_shape {
+            return Err(AutodiffError::Backend(BackendError::ShapeMismatch(
+                ShapeError::ShapeMismatch {
+                    lhs: value_out.shape().to_vec(),
+                    rhs: out_shape,
+                },
+            )));
+        }
+        let id = self.tape.push_eager(
+            Op::MaskedFill {
+                input: self.id,
+                mask: mask_f32,
+            },
+            value_out,
+        );
+        Ok(Var::from_raw(self.tape, id))
+    }
+
     /// LSTM セル 1 step（イシュー #1647・設計 `docs/autodiff-rnn-cell-
     /// tape-design.md` 決定 1・1b・1c・4・5・12）。ゲート順は `i,f,g,o`
     /// （`p.w_ih`／`p.w_hh` は `[D, 4H]`／`[H, 4H]`、bias は `[4H]`）。

@@ -52,6 +52,24 @@ pub(crate) fn validate_elementwise_binary_dims(
     validate_elementwise_len(a_len)
 }
 
+/// `cond_len`／`a_len`／`b_len` が全て一致することを検証する（3 入力
+/// 演算〈`where_cond`〉向け。イシュー #1637）。
+/// [`validate_elementwise_binary_dims`] の 3 項版。
+pub(crate) fn validate_elementwise_ternary_dims(
+    cond_len: usize,
+    a_len: usize,
+    b_len: usize,
+) -> Result<(), MetalError> {
+    if cond_len != a_len || cond_len != b_len {
+        return Err(MetalError::InvalidElementwiseShape {
+            detail: format!(
+                "elementwise length mismatch: cond_len={cond_len}, a_len={a_len}, b_len={b_len}"
+            ),
+        });
+    }
+    validate_elementwise_len(cond_len)
+}
+
 /// 単項演算向け: 長さが `u32::MAX` に収まることのみを検証する。
 ///
 /// カーネル引数 `constant uint& numel`（`shaders/elementwise.metal`）は
@@ -79,6 +97,10 @@ pub struct MetalElementwise {
     relu_f32: objc2::rc::Retained<MtlPipeline>,
     exp_f32: objc2::rc::Retained<MtlPipeline>,
     tanh_f32: objc2::rc::Retained<MtlPipeline>,
+    /// `torch.where` 相当（イシュー #1637）。
+    where_f32: objc2::rc::Retained<MtlPipeline>,
+    /// `torch.masked_fill` 相当（イシュー #1637）。
+    masked_fill_f32: objc2::rc::Retained<MtlPipeline>,
 }
 
 impl MetalElementwise {
@@ -105,6 +127,9 @@ impl MetalElementwise {
         let relu_f32 = pipeline::make_pipeline(ctx.device(), &library, "ew_relu_f32")?;
         let exp_f32 = pipeline::make_pipeline(ctx.device(), &library, "ew_exp_f32")?;
         let tanh_f32 = pipeline::make_pipeline(ctx.device(), &library, "ew_tanh_f32")?;
+        let where_f32 = pipeline::make_pipeline(ctx.device(), &library, "ew_where_f32")?;
+        let masked_fill_f32 =
+            pipeline::make_pipeline(ctx.device(), &library, "ew_masked_fill_f32")?;
 
         Ok(Self {
             add_f32,
@@ -112,6 +137,8 @@ impl MetalElementwise {
             relu_f32,
             exp_f32,
             tanh_f32,
+            where_f32,
+            masked_fill_f32,
         })
     }
 
@@ -147,6 +174,101 @@ impl MetalElementwise {
         })?;
 
         Ok(out_buf.read_to_vec())
+    }
+
+    /// 3 項演算共通の起動手続き（`where_cond` 専用。イシュー #1637）。
+    /// [`Self::run_binary`] と同一構造で入力が 1 本増えただけ。
+    fn run_ternary(
+        &self,
+        ctx: &MetalContext,
+        pipeline: &MtlPipeline,
+        cond: &[f32],
+        a: &[f32],
+        b: &[f32],
+    ) -> Result<Vec<f32>, MetalError> {
+        validate_elementwise_ternary_dims(cond.len(), a.len(), b.len())?;
+        let numel = cond.len();
+        if numel == 0 {
+            return Ok(Vec::new());
+        }
+
+        let cond_buf = MetalBuffer::new_with_data(ctx, cond)?;
+        let a_buf = MetalBuffer::new_with_data(ctx, a)?;
+        let b_buf = MetalBuffer::new_with_data(ctx, b)?;
+        let out_buf = MetalBuffer::alloc_uninit_pooled(ctx, numel)?;
+
+        ctx.dispatch_sync(|encoder| {
+            encode_ternary_dispatch(
+                encoder,
+                pipeline,
+                &cond_buf,
+                &a_buf,
+                &b_buf,
+                &out_buf,
+                numel as u32,
+            );
+        })?;
+
+        Ok(out_buf.read_to_vec())
+    }
+
+    /// 二項＋スカラー演算共通の起動手続き（`masked_fill` 専用。イシュー
+    /// #1637）。[`Self::run_binary`] と同一構造だがスカラー `value` を
+    /// 追加で `setBytes_length_atIndex` する。
+    fn run_binary_scalar(
+        &self,
+        ctx: &MetalContext,
+        pipeline: &MtlPipeline,
+        x: &[f32],
+        mask: &[f32],
+        value: f32,
+    ) -> Result<Vec<f32>, MetalError> {
+        validate_elementwise_binary_dims(x.len(), mask.len())?;
+        let numel = x.len();
+        if numel == 0 {
+            return Ok(Vec::new());
+        }
+
+        let x_buf = MetalBuffer::new_with_data(ctx, x)?;
+        let mask_buf = MetalBuffer::new_with_data(ctx, mask)?;
+        let out_buf = MetalBuffer::alloc_uninit_pooled(ctx, numel)?;
+
+        ctx.dispatch_sync(|encoder| {
+            encode_binary_scalar_dispatch(
+                encoder,
+                pipeline,
+                &x_buf,
+                &mask_buf,
+                &out_buf,
+                value,
+                numel as u32,
+            );
+        })?;
+
+        Ok(out_buf.read_to_vec())
+    }
+
+    /// 条件テンソルによる要素選択（`torch.where` 相当。イシュー #1637）。
+    pub fn run_where_f32(
+        &self,
+        ctx: &MetalContext,
+        cond: &[f32],
+        a: &[f32],
+        b: &[f32],
+    ) -> Result<Vec<f32>, MetalError> {
+        self.run_ternary(ctx, &self.where_f32, cond, a, b)
+    }
+
+    /// マスク位置を定数で置換する（`torch.masked_fill` 相当。イシュー
+    /// #1637）。
+    pub fn run_masked_fill_f32(
+        &self,
+        ctx: &MetalContext,
+        x: &[f32],
+        mask: &[f32],
+        value: f32,
+    ) -> Result<Vec<f32>, MetalError> {
+        self.run_binary_scalar(ctx, &self.masked_fill_f32, x, mask, value)
     }
 
     /// 単項演算共通の起動手続き。[`Self::run_binary`] と同一構造。
@@ -410,6 +532,90 @@ fn encode_unary_dispatch(
     encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
 }
 
+/// 3 項カーネル共通のエンコード（`where_cond` 専用。イシュー #1637）。
+/// [`encode_binary_dispatch`] と同一構造で `cond`／`a`／`b` の 3 入力
+/// バッファを index 0〜2、`out` を index 3、`numel` を index 4 へ結線
+/// する（`shaders/elementwise.metal::ew_where_f32` のバッファ宣言と
+/// 一致させる）。
+fn encode_ternary_dispatch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipeline: &MtlPipeline,
+    cond_buf: &MetalBuffer,
+    a_buf: &MetalBuffer,
+    b_buf: &MetalBuffer,
+    out_buf: &MetalBuffer,
+    numel: u32,
+) {
+    encoder.setComputePipelineState(pipeline);
+
+    // SAFETY: `encode_binary_dispatch` と同一の根拠（該当コメント参照）。
+    // `cond_buf`／`a_buf`／`b_buf`／`out_buf` は呼び出し元
+    // `ctx.dispatch_sync` が完了するまで生存する。
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(cond_buf.raw()), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(a_buf.raw()), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(b_buf.raw()), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(out_buf.raw()), 0, 3);
+    }
+
+    // SAFETY: `encode_binary_dispatch` と同一の根拠。
+    unsafe {
+        encoder.setBytes_length_atIndex(
+            std::ptr::NonNull::from(&numel).cast(),
+            std::mem::size_of::<u32>(),
+            4,
+        );
+    }
+
+    let (threadgroups, threads_per_tg) = ew_dispatch_sizes(numel);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+}
+
+/// 二項＋スカラー演算共通のエンコード（`masked_fill` 専用。イシュー
+/// #1637）。`x`／`mask` を index 0〜1、`out` を index 2、`value`
+/// （スカラー f32）を index 3、`numel` を index 4 へ結線する
+/// （`shaders/elementwise.metal::ew_masked_fill_f32` のバッファ宣言と
+/// 一致させる）。
+fn encode_binary_scalar_dispatch(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    pipeline: &MtlPipeline,
+    x_buf: &MetalBuffer,
+    mask_buf: &MetalBuffer,
+    out_buf: &MetalBuffer,
+    value: f32,
+    numel: u32,
+) {
+    encoder.setComputePipelineState(pipeline);
+
+    // SAFETY: `encode_binary_dispatch` と同一の根拠。
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(x_buf.raw()), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(mask_buf.raw()), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(out_buf.raw()), 0, 2);
+    }
+
+    // SAFETY: `value`／`numel` はローカル変数でありポインタは本呼び出し
+    // 中生存し、長さはそれぞれ `size_of::<f32>()`／`size_of::<u32>()`
+    // と一致する（`encode_binary_dispatch` と同一の根拠。`shaders/
+    // elementwise.metal` の `constant float& value`／`constant uint&
+    // numel` 宣言と型を揃える）。
+    unsafe {
+        encoder.setBytes_length_atIndex(
+            std::ptr::NonNull::from(&value).cast(),
+            std::mem::size_of::<f32>(),
+            3,
+        );
+        encoder.setBytes_length_atIndex(
+            std::ptr::NonNull::from(&numel).cast(),
+            std::mem::size_of::<u32>(),
+            4,
+        );
+    }
+
+    let (threadgroups, threads_per_tg) = ew_dispatch_sizes(numel);
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +654,22 @@ mod tests {
         let (threadgroups, threads_per_tg) = ew_dispatch_sizes(EW_THREADGROUP_WIDTH as u32 + 1);
         assert_eq!(threads_per_tg.width, EW_THREADGROUP_WIDTH);
         assert_eq!(threadgroups.width, 2);
+    }
+
+    #[test]
+    fn validate_elementwise_ternary_dims_accepts_matching_lengths() {
+        assert!(validate_elementwise_ternary_dims(4, 4, 4).is_ok());
+    }
+
+    #[test]
+    fn validate_elementwise_ternary_dims_rejects_cond_mismatch() {
+        let err = validate_elementwise_ternary_dims(4, 4, 5).unwrap_err();
+        assert!(matches!(err, MetalError::InvalidElementwiseShape { .. }));
+    }
+
+    #[test]
+    fn validate_elementwise_ternary_dims_rejects_a_mismatch() {
+        let err = validate_elementwise_ternary_dims(4, 5, 4).unwrap_err();
+        assert!(matches!(err, MetalError::InvalidElementwiseShape { .. }));
     }
 }

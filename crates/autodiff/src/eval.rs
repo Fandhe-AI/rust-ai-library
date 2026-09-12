@@ -886,6 +886,60 @@ pub(crate) fn concat(inputs: &[&Tensor<f32>], dim: usize, out_shape: &[usize]) -
     build_tensor(out, out_shape)
 }
 
+/// 条件テンソルによる要素選択のホスト参照実装（`torch.where` 相当。
+/// イシュー #1637）。`BackendOps::where_cond` が `Unsupported` を
+/// 返したときのみ `Var::where_cond` から呼ばれる（`concat` と同じ
+/// 「バックエンド実装 → フォールバック」二段構成）。
+///
+/// `cond`／`a`／`b` はいずれも呼び出し元（`Var::where_cond`）が
+/// `out_shape` へ broadcast 済み（`cond` は f32 マスクへ変換済み）で
+/// あることを前提とし、本関数は shape 再検査を行わない。真偽判定は
+/// [`fandhe_ai_tensor_core::BackendOps::where_cond`] と同じ
+/// `c != 0.0` 契約。`dense_vec_ref` で稠密化してから読むため、
+/// strided view（broadcast view 等）でも正しく動く。
+pub(crate) fn where_cond(
+    cond: &Tensor<f32>,
+    a: &Tensor<f32>,
+    b: &Tensor<f32>,
+    out_shape: &[usize],
+) -> Tensor<f32> {
+    if out_shape.contains(&0) {
+        return build_tensor(Vec::new(), out_shape);
+    }
+    let cond_data = dense_vec_ref(cond);
+    let a_data = dense_vec_ref(a);
+    let b_data = dense_vec_ref(b);
+    let out: Vec<f32> = cond_data
+        .iter()
+        .zip(a_data.iter())
+        .zip(b_data.iter())
+        .map(|((&c, &av), &bv)| if c != 0.0 { av } else { bv })
+        .collect();
+    build_tensor(out, out_shape)
+}
+
+/// マスク位置を定数で置換するホスト参照実装（`torch.masked_fill`
+/// 相当。イシュー #1637）。`BackendOps::masked_fill` が
+/// `Unsupported` を返したときのみ `Var::masked_fill` から呼ばれる。
+///
+/// `x`／`mask` は呼び出し元が同一 shape（`mask` は broadcast 済み
+/// f32 マスク）であることを保証済み。`mask != 0.0` の位置を `value`
+/// に置換し、それ以外は `x` の値をそのまま返す。
+pub(crate) fn masked_fill(x: &Tensor<f32>, mask: &Tensor<f32>, value: f32) -> Tensor<f32> {
+    let shape = x.shape().to_vec();
+    if shape.contains(&0) {
+        return build_tensor(Vec::new(), &shape);
+    }
+    let x_data = dense_vec_ref(x);
+    let mask_data = dense_vec_ref(mask);
+    let out: Vec<f32> = x_data
+        .iter()
+        .zip(mask_data.iter())
+        .map(|(&xv, &mv)| if mv != 0.0 { value } else { xv })
+        .collect();
+    build_tensor(out, &shape)
+}
+
 /// CrossEntropy 損失（log-sum-exp 安定化。クラス次元 `class_dim` 指定。
 /// #191・親イシュー #189）。shape 検査（`class_dim` 範囲・targets
 /// shape 一致・targets 添字範囲）は呼び出し元（`var.rs::

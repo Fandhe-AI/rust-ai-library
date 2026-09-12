@@ -18,16 +18,19 @@ const ELEMENTWISE_METAL_SOURCE: &str = include_str!("../src/shaders/elementwise.
 /// `crates/backend-metal/src/shaders/gemm.metal` のソース全文。
 const GEMM_METAL_SOURCE: &str = include_str!("../src/shaders/gemm.metal");
 
-/// elementwise 5 カーネル（`ew_add_f32`／`ew_mul_f32`／`ew_relu_f32`／
-/// `ew_exp_f32`／`ew_tanh_f32`）がいずれも実在することをロックする。
+/// elementwise 7 カーネル（`ew_add_f32`／`ew_mul_f32`／`ew_relu_f32`／
+/// `ew_exp_f32`／`ew_tanh_f32`／`ew_where_f32`／`ew_masked_fill_f32`。
+/// 後 2 者はイシュー #1637 で追加）がいずれも実在することをロックする。
 #[test]
-fn elementwise_metal_defines_all_five_kernels() {
+fn elementwise_metal_defines_all_seven_kernels() {
     for name in [
         "kernel void ew_add_f32(",
         "kernel void ew_mul_f32(",
         "kernel void ew_relu_f32(",
         "kernel void ew_exp_f32(",
         "kernel void ew_tanh_f32(",
+        "kernel void ew_where_f32(",
+        "kernel void ew_masked_fill_f32(",
     ] {
         assert!(
             ELEMENTWISE_METAL_SOURCE.contains(name),
@@ -36,21 +39,22 @@ fn elementwise_metal_defines_all_five_kernels() {
     }
 }
 
-/// REQ-8: elementwise 5 カーネルすべてが `if (idx < numel)` の手動境界
+/// REQ-8: elementwise 7 カーネルすべてが `if (idx < numel)` の手動境界
 /// チェックを維持していることをロックする（1 スレッド = 1 要素の 1 次元
 /// グリッドで `div_ceil` により切り上げ生成するため、末尾ブロックで
 /// `idx` が `numel` を超えるスレッドが必ず発生する。
 /// `crate::elementwise::ew_dispatch_sizes` 参照）。
 #[test]
 fn elementwise_metal_kernels_keep_manual_bounds_check() {
-    // ファイル冒頭コメント中の言及分（1 件）を含みうるため `>= 5`（5 カーネル
-    // 分）で検証する（`elementwise_metal_defines_all_five_kernels` が
-    // 5 カーネルの実在を別途ロックしているため、コメントとの取り違えでの
-    // 見逃しは起きない）。
+    // ファイル冒頭コメント中の言及分（1 件）を含みうるため `>= 7`（7 カーネル
+    // 分。イシュー #1637 で 5→7 へ更新）で検証する
+    // （`elementwise_metal_defines_all_seven_kernels` が 7 カーネルの
+    // 実在を別途ロックしているため、コメントとの取り違えでの見逃しは
+    // 起きない）。
     let occurrences = ELEMENTWISE_METAL_SOURCE.matches("if (idx < numel)").count();
     assert!(
-        occurrences >= 5,
-        "elementwise.metal の 5 カーネルすべてに `if (idx < numel)` の手動境界チェックが\
+        occurrences >= 7,
+        "elementwise.metal の 7 カーネルすべてに `if (idx < numel)` の手動境界チェックが\
          必要です（REQ-8）。実際の出現数: {occurrences}"
     );
 }
