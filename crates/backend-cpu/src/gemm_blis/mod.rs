@@ -2955,9 +2955,15 @@ fn dispatch_two_d_dynamic(
     }
 }
 
-/// aarch64 版 [`dispatch_two_d_dynamic`]（#1311）。他 dispatch 系
-/// （[`dispatch_ic_dynamic`] 等）と同じ理由で NEON 固定。本番結線済み
-/// （#1313）。
+/// aarch64 版 [`dispatch_two_d_dynamic`]（#1311）。既定は NEON 固定
+/// （他 dispatch 系〈[`dispatch_ic_dynamic`] 等〉と同じ理由。本番結線済み
+/// （#1313）だが、[`SME_PRODUCTION_ENABLED`] が `true` かつ形状が
+/// [`sme_shape_eligible`] を満たし、かつ実行 CPU が SME・非拡張 FP32
+/// 外積に対応する（[`microkernel::SmeKernel::try_new`]）場合のみ SME
+/// マイクロカーネルへ切り替える（イシュー #1587）。NEON は aarch64 の
+/// baseline ISA のため実行時検出不要（本関数 doc 冒頭参照）だが、SME は
+/// `Avx2Kernel`／`Avx512Kernel` と同型の「検出済みトークンのみ構築可能」
+/// パターンで安全性を担保する。
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_two_d_dynamic(
@@ -2972,6 +2978,23 @@ fn dispatch_two_d_dynamic(
     jobs_per_worker: usize,
 ) -> Result<(), GemmError> {
     debug_assert_eq!(Isa::detect(), Isa::Neon);
+    if SME_PRODUCTION_ENABLED
+        && sme_shape_eligible(rows.end - rows.start, n, k)
+        && let Some(kernel) = microkernel::SmeKernel::try_new()
+    {
+        return gemm_blis_two_d_dynamic_region(
+            kernel,
+            a,
+            b,
+            c,
+            n,
+            k,
+            rows,
+            blocks,
+            transpose,
+            jobs_per_worker,
+        );
+    }
     gemm_blis_two_d_dynamic_region(
         microkernel::NeonKernel,
         a,
@@ -3047,6 +3070,41 @@ const TWO_D_JOBS_PER_WORKER: usize = 2;
 /// `docs/perf/cpu-gemm-2d-dynamic-partition-ab.md`・
 /// `docs/perf/cpu-gemm-candle-gate-remeasurement.md` §20 を参照。
 const TWO_D_DYNAMIC_PRODUCTION_ENABLED: bool = true;
+
+/// aarch64 SME（`fmopa`。イシュー #1587）マイクロカーネルを
+/// [`dispatch_two_d_dynamic`] の aarch64 版へ形状条件付きで結線するか
+/// どうかの単一 const ゲート（[`TWO_D_DYNAMIC_PRODUCTION_ENABLED`]・
+/// `thread_limit::BIG_CORE_LIMIT_ENABLED` と同型のロールバック機構）。
+///
+/// `false` の間は実行 CPU が SME に対応していても常に
+/// [`microkernel::NeonKernel`] が選ばれる（#1313 以前と bit 完全一致）。
+/// 実測（R1〜R4。issue #1587 コメントの事前登録規則）が完了し ADOPT が
+/// 確定するまでは `false` を維持する。採否記録は
+/// `docs/perf/cpu-gemm-sme-fmopa-microkernel.md` を参照。
+#[cfg(target_arch = "aarch64")]
+const SME_PRODUCTION_ENABLED: bool = false;
+
+/// [`SME_PRODUCTION_ENABLED`] が `true` のときに SME 経路を候補とする
+/// 形状しきい値（イシュー #1587 事前登録規則 R4）。`sme_shape_eligible`
+/// の純関数として実装し単体テスト可能にする。しきい値の値自体は
+/// マイクロ A/B（R4）で確定するまでの仮値であり、`docs/perf/
+/// cpu-gemm-sme-fmopa-microkernel.md` の実測完了後に確定値へ更新する。
+#[cfg(target_arch = "aarch64")]
+const SME_MIN_M: usize = 256;
+#[cfg(target_arch = "aarch64")]
+const SME_MIN_N: usize = 256;
+#[cfg(target_arch = "aarch64")]
+const SME_MIN_K: usize = 64;
+
+/// `(m_total, n, k)` が SME 経路の形状しきい値（[`SME_MIN_M`]／
+/// [`SME_MIN_N`]／[`SME_MIN_K`]）を満たすかどうかを判定する純関数
+/// （イシュー #1587）。`m_total` は呼び出し元の region 全体の行数
+/// （job 分割前）を渡す契約（`dispatch_two_d_dynamic` の `rows.end -
+/// rows.start` 相当）。
+#[cfg(target_arch = "aarch64")]
+fn sme_shape_eligible(m_total: usize, n: usize, k: usize) -> bool {
+    m_total >= SME_MIN_M && n >= SME_MIN_N && k >= SME_MIN_K
+}
 
 /// テスト・A/B 計測専用: [`GemmDriverVariant::TwoDDynamic`] の
 /// `jobs_per_worker`／`transpose` を注入できるパラメータ化入口
@@ -3149,6 +3207,16 @@ pub(crate) enum GemmDriverVariant {
     /// 主案 S′）を採り `unsafe` を追加しない。両実機 A/B・採否判定は
     /// #1312、本番結線は #1313 が引き継ぐ。
     TwoDDynamic,
+    /// (mc, nc) 2D 動的分配を SME（`fmopa`。イシュー #1587）マイクロ
+    /// カーネル強制で計測する A/B 専用候補。実行 CPU が SME・非拡張
+    /// FP32 外積に対応しない環境では [`gemm_blis_parallel_variant`] が
+    /// panic する（`#[cfg(test)]` 限定の A/B 計測専用入口のため `Result`
+    /// 化はせず早期に原因を明示する。`all_gemm_driver_variants` には
+    /// 含めない・呼び出し元が `microkernel::SmeKernel::try_new().is_some()`
+    /// を確認してから使う契約）。aarch64 限定（`SmeKernel` 自体が
+    /// aarch64 限定トークンのため）。
+    #[cfg(target_arch = "aarch64")]
+    TwoDDynamicSme,
 }
 
 /// [`GemmDriverVariant`] で指定した候補を強制実行する A/B 計測専用入口
@@ -3211,6 +3279,27 @@ pub(crate) fn gemm_blis_parallel_variant(
             GemmTranspose::Nn,
             TWO_D_JOBS_PER_WORKER,
         ),
+        #[cfg(target_arch = "aarch64")]
+        GemmDriverVariant::TwoDDynamicSme => {
+            // 本 variant のドキュメント参照: 呼び出し元が
+            // `microkernel::SmeKernel::try_new().is_some()` を確認済み
+            // であることを契約とする（`#[cfg(test)]` 限定の A/B 計測
+            // 専用入口のため `expect` で早期に原因を明示する）。
+            let kernel = microkernel::SmeKernel::try_new()
+                .expect("TwoDDynamicSme variant requires SME-capable CPU");
+            gemm_blis_two_d_dynamic_region(
+                kernel,
+                a,
+                b,
+                c,
+                n,
+                k,
+                0..m,
+                blocks,
+                GemmTranspose::Nn,
+                TWO_D_JOBS_PER_WORKER,
+            )
+        }
     }
 }
 
@@ -4857,6 +4946,109 @@ mod tests {
         }
     }
 
+    /// イシュー #1587: `GemmDriverVariant::TwoDDynamicSme`（`fmopa`
+    /// マイクロカーネル強制）が本番入口（`gemm_blis_two_d_dynamic_region`
+    /// 経由）で `gemm_naive` と bit 完全一致することを検証する。
+    /// `all_gemm_driver_variants` には含めない（SME 非対応環境で
+    /// `.expect` panic するため）ため、`SmeKernel::try_new()` で実行時
+    /// スキップする独立テストとする（`microkernel::sme::tests` の単体
+    /// テストが個別カーネル呼び出しを検証するのに対し、本テストは
+    /// [`SME_MIN_M`]／[`SME_MIN_N`]／[`SME_MIN_K`] のしきい値を跨ぐ
+    /// 形状・端タイル・複数スレッド数を通じた 5-loop ドライバ全体の
+    /// bit 完全一致を検証する）。
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "実機（SME 対応 aarch64。例: Apple M4）限定の検証専用（イシュー #1587。 \
+                cargo test -p fandhe-ai-backend-cpu --lib -- --ignored \
+                gemm_blis_parallel_variant_sme_matches_naive_bit_exact_when_available \
+                --nocapture）"]
+    fn gemm_blis_parallel_variant_sme_matches_naive_bit_exact_when_available() {
+        if microkernel::SmeKernel::try_new().is_none() {
+            eprintln!("SME 非対応環境のためスキップ");
+            return;
+        }
+        let shapes: &[(usize, usize, usize)] = &[
+            (SME_MIN_M, SME_MIN_N, SME_MIN_K),             // しきい値ちょうど
+            (SME_MIN_M + 5, SME_MIN_N + 3, SME_MIN_K + 7), // 端タイルあり
+            (SME_MIN_M * 2, SME_MIN_N * 2, SME_MIN_K * 3), // MC/KC/NC 境界を跨ぐ
+        ];
+        let thread_counts = [1usize, 2, 4];
+
+        for &(m, n, k) in shapes {
+            let a = xorshift32_vec(0xa5a5_a5a5 ^ (m as u32), m * k);
+            let b = xorshift32_vec(0x5a5a_5a5a ^ (n as u32), k * n);
+
+            let mut c_naive = vec![0.0f32; m * n];
+            crate::gemm::gemm_naive(&a, &b, &mut c_naive, m, n, k).unwrap();
+
+            for &num_threads in &thread_counts {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .build()
+                    .unwrap_or_else(|e| {
+                        panic!("{num_threads} スレッドの rayon プール構築に失敗: {e}")
+                    });
+
+                let mut c = vec![0.0f32; m * n];
+                pool.install(|| {
+                    gemm_blis_parallel_variant(
+                        GemmDriverVariant::TwoDDynamicSme,
+                        &a,
+                        &b,
+                        &mut c,
+                        m,
+                        n,
+                        k,
+                        default_blocks(),
+                    )
+                    .unwrap()
+                });
+                assert_eq!(
+                    c_naive, c,
+                    "TwoDDynamicSme shape=({m},{n},{k}) num_threads={num_threads} は \
+                     gemm_naive と bit 完全一致するはず（#1587）"
+                );
+            }
+        }
+    }
+
+    /// イシュー #1587: [`sme_shape_eligible`] の境界値挙動（純関数の
+    /// 単体テスト。実行環境の SME 対応有無に依らず実行できる）。
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sme_shape_eligible_boundary_values() {
+        assert!(sme_shape_eligible(SME_MIN_M, SME_MIN_N, SME_MIN_K));
+        assert!(!sme_shape_eligible(SME_MIN_M - 1, SME_MIN_N, SME_MIN_K));
+        assert!(!sme_shape_eligible(SME_MIN_M, SME_MIN_N - 1, SME_MIN_K));
+        assert!(!sme_shape_eligible(SME_MIN_M, SME_MIN_N, SME_MIN_K - 1));
+        assert!(sme_shape_eligible(
+            SME_MIN_M * 4,
+            SME_MIN_N * 4,
+            SME_MIN_K * 4
+        ));
+    }
+
+    /// イシュー #1587: [`SME_PRODUCTION_ENABLED`] が `false` の間は
+    /// 本番入口（`dispatch_two_d_dynamic` 経由）が実行 CPU の SME 対応
+    /// 有無に関わらず常に [`microkernel::NeonKernel`] を選ぶ（#1313 以前
+    /// と bit 完全一致）ことを、大きめの形状（しきい値を超える）で確認
+    /// する回帰テスト。`SME_PRODUCTION_ENABLED` が誤って `true` へ変更
+    /// された場合、この形状は本テストではなく
+    /// `gemm_blis_parallel_variant_sme_matches_naive_bit_exact_when_available`
+    /// 側の bit 一致契約でカバーされるため、本テストは
+    /// `SME_PRODUCTION_ENABLED` の現在値が `false` であることそのものを
+    /// 検証する（値のドリフト検出）。
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn sme_production_enabled_is_false_pending_measurement() {
+        assert!(
+            !SME_PRODUCTION_ENABLED,
+            "R1〜R4（イシュー #1587 事前登録規則）の実測完了・ADOPT 確定まで \
+             SME_PRODUCTION_ENABLED は false を維持する契約"
+        );
+    }
+
     /// イシュー #1366: `IcDynamic` が小さい **kc** で pc 同期点を複数
     /// 強制する形状（`gemm_blis_shared_b_pc_outer_multi_sync_point_matches_serial_bit_exact`
     /// と同型の意図）でも直列実装（`ScalarKernel` 経由の
@@ -6313,6 +6505,55 @@ mod tests {
                 candidate.label(),
                 candidate.jobs_per_worker_for_log(),
             );
+        }
+    }
+
+    // --- SME（`fmopa`）vs NEON A/B（イシュー #1587。事前登録規則
+    //     R4「しきい値の決め方」・R1〜R2「本番性能・非後退」の生データ
+    //     取得用。5 プロセス起動中央値の正式プロトコルは
+    //     `docs/perf/logs/cpu-gemm-sme-fmopa-1587/` のオーケストレーション
+    //     スクリプトへ委ねる） ---
+
+    /// SME マイクロカーネル（`GemmDriverVariant::TwoDDynamicSme`）と本番
+    /// NEON 経路（`GemmDriverVariant::TwoDDynamic`）を interleave 方式
+    /// （[`run_ab_candidates_interleaved`] と同じ round-robin＋開始位置
+    /// ローテーション）で比較する。SME 非対応環境（GB10 等）では実行時
+    /// スキップする。出力形式は既存 A/B と揃え（`variant=… size=…
+    /// median_gflops=…`）、集計スクリプトを共用できるようにする。
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "実機（M4 Max。SME 対応環境限定）での A/B 計測専用（#1587。 \
+                cargo test -p fandhe-ai-backend-cpu --release --lib -- --ignored \
+                sme_vs_neon_ab_shape_sweep --nocapture）"]
+    fn sme_vs_neon_ab_shape_sweep() {
+        if microkernel::SmeKernel::try_new().is_none() {
+            eprintln!("SME 非対応環境のためスキップ");
+            return;
+        }
+        // R4 しきい値スイープの対象格子（issue #1587 事前登録規則）に加え、
+        // R1 の framework-compare 対象形状に近い正方形状も含める。
+        let shapes: &[(usize, usize, usize)] = &[
+            (64, 64, 32),
+            (128, 128, 64),
+            (256, 256, 64),
+            (256, 256, 128),
+            (512, 512, 256),
+            (1024, 1024, 512),
+            (2048, 2048, 1024),
+        ];
+        for &(m, n, k) in shapes {
+            let a = xorshift32_vec(0x1234_abcd ^ (m as u32), m * k);
+            let b = xorshift32_vec(0x5678_ef01 ^ (n as u32), k * n);
+
+            let candidates: Vec<(GemmDriverVariant, BlockSizes)> = vec![
+                (GemmDriverVariant::TwoDDynamic, default_blocks()),
+                (GemmDriverVariant::TwoDDynamicSme, default_blocks()),
+            ];
+            let gflops = run_candidates_interleaved(&candidates, &a, &b, m, n, k, 10);
+            let labels = ["NEON(TwoDDynamic)", "SME(TwoDDynamicSme)"];
+            for (label, gflops) in labels.iter().zip(gflops) {
+                println!("variant={label} size=({m},{n},{k}) median_gflops={gflops:.3}");
+            }
         }
     }
 }

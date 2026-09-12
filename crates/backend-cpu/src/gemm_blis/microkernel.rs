@@ -67,6 +67,14 @@ pub mod scalar;
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
 
+// イシュー #1587: Arm SME（Scalable Matrix Extension）`fmopa` マイクロ
+// カーネル。NEON と同じく `cfg(target_arch = "aarch64")` 限定だが、NEON
+// と異なり実行時検出（[`SmeKernel::try_new`]）を経由しなければ安全に
+// 呼べない（`avx2`／`avx512` と同型の「検出済みトークンのみ構築可能」
+// パターン。本モジュール doc 冒頭参照）。
+#[cfg(target_arch = "aarch64")]
+pub mod sme;
+
 #[cfg(target_arch = "x86_64")]
 pub mod avx2;
 
@@ -704,6 +712,128 @@ impl Microkernel for NeonBLaneqVecKernel {
     }
 }
 
+/// aarch64 SME（Scalable Matrix Extension）`fmopa` トークン（イシュー
+/// #1587）。`SmeKernel::try_new` 経由でのみ構築でき、これが「**構築した
+/// スレッド**の実行 CPU が SME・非拡張 FP32 外積（`SME_F32F32`）に対応し
+/// SVL=512 bit である」ことを保証する（`Avx2Kernel`〈x86_64 限定のため
+/// コードスパン表記〉と同型の「検出済みトークンのみ構築可能」パターン）。
+///
+/// ## SVL はスレッドごとに異なりうる（codex-review P0 指摘
+/// `PRRT_kwDOTuUCJc6h0P7Y` 対応）
+///
+/// Arm SME の SVL は Linux では `prctl(PR_SME_SET_VL)` でスレッドごとに
+/// 変更可能であり、`Avx2Kernel`／`Avx512Kernel` の CPUID ベース検出
+/// （プロセス内で不変）とは異なりプロセス全体で不変とは限らない。本
+/// トークンは `Copy` のため構築したスレッドとは別のスレッド（Rayon
+/// worker 等）へそのまま渡されうるが、[`Microkernel::run`]／
+/// [`Microkernel::run_with_ldc`] は **実際に `fmopa` を発行するスレッド
+/// 自身で [`crate::sme_detect::sme_report`] を呼び直し、SVL がその
+/// スレッド上でも要求値と一致することを確認してから**
+/// `unsafe { sme::kernel_unchecked… }` を呼ぶ。一致しない場合は
+/// `panic!` で停止する（本カーネルは MR=16×NR=16 固定でパックされた
+/// 入力を前提とし、MR=8×NR=12 の [`NeonKernel`] 等へ実行時に安全に
+/// 差し替えることはできない〈パック済みバッファの形状が食い違う〉ため、
+/// 差し替えフォールバックではなく `unsafe` 呼び出し自体を行わない
+/// fail-closed を採る。`.claude/rules/security.md` の fail-closed 方針）。
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+pub struct SmeKernel {
+    /// 外部からの直接構築を禁止する非公開フィールド（`Avx2Kernel`〈x86_64
+    /// 限定のためコードスパン表記〉と同じ封止パターン）。
+    _private: (),
+}
+
+#[cfg(target_arch = "aarch64")]
+impl SmeKernel {
+    /// 実行 CPU が SME・非拡張 FP32 外積（`SME_F32F32`）に対応し
+    /// SVL=512 bit（64 バイト）の場合のみ `Some` を返す
+    /// （[`crate::sme_detect::sme_report`] が fail-closed に判定する。
+    /// モジュール doc「検出との関係」節参照）。**この判定は呼び出した
+    /// スレッド上でのみ有効**（構造体 doc「SVL はスレッドごとに異なり
+    /// うる」節参照）であり、`run`／`run_with_ldc` は実行スレッド自身で
+    /// 再確認する。
+    pub(crate) fn try_new() -> Option<Self> {
+        if crate::sme_detect::sme_report().kernel_enabled {
+            Some(Self { _private: () })
+        } else {
+            None
+        }
+    }
+
+    /// `run`／`run_with_ldc` が `unsafe` 呼び出し直前に共通で行う
+    /// **実行スレッド自身の** SVL 再確認（構造体 doc 参照）。
+    /// `sme_detect::sme_report()` の SVL 読み取り部分はキャッシュせず
+    /// 毎回 `rdsvl`（メモリアクセスを伴わない読み取り専用の 1 命令）を
+    /// 発行するため、呼び出しのたびに再検証しても計測に有意な影響を
+    /// 与えない（`sme_detect` モジュール doc 参照）。
+    ///
+    /// ## panic ではなく bool を返す（codex-review P1 再指摘
+    /// `PRRT_kwDOTuUCJc6h0ZMD` への対応）
+    ///
+    /// 以前は本メソッドが `assert!` で判定していたため、`SmeKernel` を
+    /// 構築したスレッドと実際に `fmopa` を発行するスレッド（Rayon
+    /// worker 等）の SVL が異なる場合、正常な形状の入力でも panic して
+    /// いた。`run_with_ldc` は `Result` を返す入口である一方 `run` は
+    /// トレイトの必須メソッド（`#691` レビュー再指摘により非破壊のため
+    /// 非 `Result`。[`Microkernel::run`] doc 参照）で `Result` 化でき
+    /// ないため、両者で共通に扱えるよう本メソッド自体は `bool` を返す
+    /// 判定のみに留め、呼び出し元（`run`／`run_with_ldc`）が非対応時に
+    /// [`sme::scalar_fallback_kernel`]／[`sme::scalar_fallback_with_ldc`]
+    /// （`compute` と同一の演算列を安全な Rust で再現し、有限値入力で
+    /// bit 完全一致するフォールバック。`sme` モジュール該当関数 doc
+    /// 参照）へ切り替える。`.claude/rules/security.md`／AGENTS.md
+    /// 「本番経路の panic 禁止」への抵触を解消しつつ、実行スレッドでの
+    /// SVL 再確認自体は維持する。
+    fn current_thread_capable(&self) -> bool {
+        crate::sme_detect::sme_report().kernel_enabled
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Microkernel for SmeKernel {
+    const MR: usize = sme::MR;
+    const NR: usize = sme::NR;
+
+    fn run(&self, ap: &[f32], bp: &[f32], c_tile: &mut [f32], kc_len: usize) {
+        // [`ScalarKernel::run`] のドキュメント参照（`Result` を `panic!`
+        // へ変換する経路を持たず、非対応時は
+        // [`sme::scalar_fallback_kernel`] へ委譲する。`current_thread_capable`
+        // doc 参照）。
+        if self.current_thread_capable() {
+            // SAFETY: `current_thread_capable` が **この呼び出しを実行
+            // しているスレッド自身**で SME 対応・SVL=64 バイトを確認済み
+            // （`SmeKernel` 構造体 doc「SVL はスレッドごとに異なりうる」
+            // 節。`Self` が try_new() 経由でのみ構築可能という事実だけ
+            // では、構築スレッドと実行スレッドが異なりうる Rayon worker
+            // 分配のもとでは不十分なため、ここで実行スレッド自身の確認
+            // を必須とする）。`sme::kernel_unchecked` の `# Safety` 契約
+            // を満たす。
+            unsafe { sme::kernel_unchecked(ap, bp, c_tile, kc_len) }
+        } else {
+            sme::scalar_fallback_kernel(ap, bp, c_tile, kc_len);
+        }
+    }
+
+    fn run_with_ldc(
+        &self,
+        ap: &[f32],
+        bp: &[f32],
+        c: &mut [f32],
+        ldc: usize,
+        kc_len: usize,
+    ) -> Result<(), TileBoundsError> {
+        if self.current_thread_capable() {
+            // SAFETY: `run` と同じ理由で `current_thread_capable` を
+            // 実行スレッド自身で必ず確認してから呼ぶ
+            // （`sme::kernel_unchecked_with_ldc` の `# Safety` 契約を
+            // 満たす）。
+            unsafe { sme::kernel_unchecked_with_ldc(ap, bp, c, ldc, kc_len) }
+        } else {
+            sme::scalar_fallback_with_ldc(ap, bp, c, ldc, kc_len)
+        }
+    }
+}
+
 /// x86_64 AVX2+FMA トークン。`Avx2Kernel::try_new` 経由でのみ構築でき、
 /// これが実行 CPU の AVX2+FMA 対応を保証する（[`Microkernel::run`] 内部の
 /// `unsafe { avx2::kernel_unchecked(...) }` の SAFETY 根拠）。
@@ -1165,6 +1295,17 @@ mod tests {
     fn avx2_kernel_try_new_matches_feature_detection() {
         let expected = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
         assert_eq!(Avx2Kernel::try_new().is_some(), expected);
+    }
+
+    /// [`SmeKernel::try_new`] は [`crate::sme_detect::sme_report`] の
+    /// `kernel_enabled` 判定と一致する（イシュー #1587。`avx2` 版と
+    /// 同型の回帰テスト。SME 対応・非対応いずれの実行環境でも
+    /// 意味のある表明になる）。
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sme_kernel_try_new_matches_feature_detection() {
+        let expected = crate::sme_detect::sme_report().kernel_enabled;
+        assert_eq!(SmeKernel::try_new().is_some(), expected);
     }
 
     #[cfg(all(target_arch = "x86_64", avx512_stable))]

@@ -164,6 +164,12 @@ pub mod reduction;
 pub mod rmsnorm;
 mod rnn_cell;
 mod small_shape_thread_cap;
+// イシュー #1587: Arm SME（Scalable Matrix Extension）の実行時検出
+// （fail-closed。macOS sysctl／Linux /proc/cpuinfo・rdsvl による SVL 確認）。
+// `gemm_blis::microkernel::SmeKernel::try_new` から呼ばれる。診断専用の
+// `SmeReport`／`sme_report()` のみ公開し facade へは昇格しない
+// （`thread_limit::ThreadLimitReport` と同型の位置づけ）。
+mod sme_detect;
 pub mod softmax;
 mod thread_limit;
 
@@ -190,5 +196,6 @@ pub use parity::{
 };
 pub use rmsnorm::{RmsNormError, run_rmsnorm_f32};
 pub use small_shape_thread_cap::{SmallShapeCapReport, small_shape_cap_report};
+pub use sme_detect::{SmeReport, sme_report};
 pub use softmax::{SoftmaxError, run_log_softmax_f32, run_softmax_f32};
 pub use thread_limit::{ThreadLimitReport, thread_limit_report};
