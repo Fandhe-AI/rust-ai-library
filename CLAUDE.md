@@ -62,6 +62,7 @@ fandhe-ai/
 │   ├── workflows/           # implement-issue-tree.js（skills への相対 symlink）
 │   └── settings.json        # SessionStart / PostToolUse hooks
 └── docs/
+    ├── autodiff-checkpoint-design.md # activation checkpointing（任意サブグラフ再計算）の設計・実装記録（`Tape::checkpoint`／`Var::checkpoint_from`・`Op::is_checkpoint_eligible()`〈`MatMul`／`Sigmoid`／`Sum`／`Max`＋既存 view 系限定〉・`recompute_value`／`recompute_fallible`／`recompute_infallible`〈`resolve_view` の一般化〉・`backward_impl` の反復ごと借用への再構成・reentrant init 問題の解決・Metal 実機 bit 同一実測・ピークメモリ実測。CUDA 実機は未実測。イシュー #1624）
     ├── autodiff-higher-order-grad-decision.md # 高階微分（grad of grad）の設計判断（VJP の VJP・テープ再設計の要否検討。同一テープ方式は backward_impl の不変借用と衝突・子テープ方式〈create_graph〉を主案・forward-over-reverse〈HVP 限定〉を代替として比較。段階 0〈現時点では非対応と明文化〉を確定し実装は前提イシュー〈#1593／#1597／#1599／#1601／#1612〉完了後の別イシューへ引き継ぐ。承認事項は §10。#1622）
     ├── autodiff-linalg-design.md # 線形代数（inv／solve／det／qr／cholesky／svd）・matrix_norm の設計（REQ-9 2026-09-12 追記の Tier 2 対応・多出力ノード〈QrQ/QrR・SvdU/SvdS/SvdVh〉設計・数値契約〈f64 内部計算・符号／ゲージ規約〉・VJP 方式・eval と CPU 実装の意図的複製・テスト構成。CPU 実装先行・GPU は Unsupported フォールバック。イシュー #1621・親 #1573）
     ├── autodiff-nograd-leaf-dinput-skip-decision.md # 非学習葉（活性化入力 x 等）への d_input 伝播スキップの設計判断（`requires_grad` 前方伝播案の採用・`Gradients::get` 契約整理・多層依存整理・起票草案。#1151 起票案 I・#1219）

@@ -241,7 +241,7 @@ Phase 3（親 #1573）の各 issue へ対応付ける。
 | 線形代数（inv／solve／det／qr／cholesky／svd） | #1621（実装済み。`Var::inv`／`solve`／`det`／`cholesky`／`qr`／`svd`／`matrix_norm`。rank-2 限定・CPU 実装先行・GPU は `Unsupported` フォールバック。`docs/autodiff-linalg-design.md`） |
 | 高階微分 | #1622（設計記録。`docs/autodiff-higher-order-grad-decision.md`） |
 | custom autograd Function | #1623（設計記録） |
-| activation checkpointing | #1624 |
+| activation checkpointing | #1624（実装済み。`Var::checkpoint_from`／内部クレート `Tape::checkpoint`。対象 Op は `MatMul`／`Sigmoid`／`Sum`／`Max`・view 系〈`Reshape`／`Transpose`〉限定〈`Op::is_checkpoint_eligible()`〉。facade `Tape` passthrough は承認未取得のため未追加——facade からは既存の `Var` 再エクスポート経由〈`Var::checkpoint_from`〉で到達可能。`docs/autodiff-checkpoint-design.md`） |
 | AMP | #1625 |
 | f64／f16／bf16 演算 | #1626 |
 | **量子化** | #1627（除外事項「分散学習・量子化の網羅対応」〈Won't・条件付き〉に従属。実装着手は同除外事項の格上げ条件充足と Phase 4 要件見直しでの新 REQ 追加のユーザー承認まで不可。5 節参照） |

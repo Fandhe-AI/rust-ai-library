@@ -118,6 +118,15 @@
 //! これは `docs/kernel-fusion.md` が既に確定させた「transpose を挟む
 //! 連鎖は融合しない」方針と整合する。
 
+//! イシュー #1624 で activation checkpointing（`torch.utils.checkpoint`
+//! 相当）を追加した。`Tape::checkpoint`（閉包版）／`Var::checkpoint_from`
+//! （低儀式版。facade からはこちらのみ既存の `Var` 再エクスポート経由で
+//! 到達可能）が区間内の再計算可能ノード（`Op::MatMul`／`Sigmoid`／
+//! `Sum`／`Max`。`Op::is_checkpoint_eligible()`）の forward 値を解放し、
+//! 上記 view 系ノードの `resolve_view` 機構を一般化した `tape::
+//! recompute_value`／`recompute_fallible`／`recompute_infallible` が
+//! backward 時に再導出する。設計判断・実装記録は `docs/
+//! autodiff-checkpoint-design.md` を参照。
 //! #1597 で同じ `push_view`／`resolve_view` 骨格を任意軸並べ替え・
 //! ブロードキャストへ一般化した `Var::permute`（`tape::Op::Permute`。
 //! zero-copy）・`Var::broadcast_to`／`expand`（`tape::Op::BroadcastTo`。

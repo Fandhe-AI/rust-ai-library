@@ -688,6 +688,92 @@ impl Op {
                 | Op::Narrow { .. }
         )
     }
+
+    /// activation checkpointing（イシュー #1624・`docs/
+    /// autodiff-checkpoint-design.md`）が値を解放してよい Op かどうか。
+    /// `Tape::checkpoint`／`Var::checkpoint_from`（`register_checkpoint`
+    /// 経由）が区間内ノードを走査するたびに呼び、`true` のノードのみ
+    /// `TapeNode::value` を `take()` して `recompute` フラグを立てる
+    /// （`recompute_fallible`／`recompute_infallible` が入力側から再導出
+    /// する。同ファイル下部）。
+    ///
+    /// **網羅 match（ワイルドカードなし）とする理由**: 新しい `Op`
+    /// variant を追加するたびに「checkpoint で解放してよいか」を
+    /// コンパイルエラーで判断させ、判断漏れのまま既定で解放（または
+    /// 既定で非解放）にしてしまう事故を防ぐ（`.claude/rules/
+    /// out-of-scope-tracking.md` の「スコープ外事項を放置しない」精神を
+    /// 型検査で強制する）。
+    pub(crate) fn is_checkpoint_eligible(&self) -> bool {
+        match self {
+            // 入力のみから決定論的に再計算できる（`Var::matmul`／
+            // `sigmoid`／`sum`／`max` と同じ `ops`／`eval` 呼び出しを
+            // `recompute_fallible` が再現するため forward と bit 同一）。
+            Op::MatMul(..) | Op::Sigmoid(..) | Op::Sum { .. } | Op::Max { .. } => true,
+            // view（既存 `push_view`／再導出契約の一般化）。キャッシュ
+            // 済み view 値は基底バッファへの `Arc` を握るため、解放しな
+            // いと基底側を解放しても実メモリが減らない。`Op::Permute`／
+            // `Op::BroadcastTo`（イシュー #1597 で `Op::is_view()` へ
+            // 追加された variant）・`Op::Narrow`（イシュー #1598 で
+            // 同じく `Op::is_view()` へ追加された variant。
+            // `recompute_value` が `base.narrow(..)` で再導出できる）も
+            // 同じ view 系のため同列に扱う（merge 時の非網羅 match
+            // 是正。review 指摘）。
+            Op::Reshape { .. }
+            | Op::Transpose { .. }
+            | Op::Permute { .. }
+            | Op::BroadcastTo { .. }
+            | Op::Narrow { .. } => true,
+            // `Op::Concat` は複数入力を 1 バッファへ結合する実体化演算
+            // であり view ではない。`recompute_value` に対応する再導出
+            // 分岐が未実装（`_` ワイルドカードで契約違反 `Err` を返す
+            // 経路にしか到達しない）ため、値を解放すると再導出不能に
+            // なる。§8 のスコープ外事項として非適格のまま保持する。
+            Op::Concat { .. } => false,
+            // 遅延 elementwise: 値を持つ場合は `pre_materialize_for_
+            // binary_merge`／`push_lazy` の `at_limit` による
+            // `MAX_FUSED_CHAIN_LEN` 上限維持のための自己実体化であり、
+            // 解放すると `build_lazy_plan` が連鎖を突き抜けて不変条件を
+            // 壊す（`docs/autodiff-checkpoint-design.md` §3.3）。
+            Op::Add(..) | Op::Mul(..) | Op::Relu(..) | Op::Exp(..) | Op::Tanh(..) => false,
+            // 非適格（正しさ優先・メモリ削減はベストエフォート）:
+            // `Leaf`／`ResidentLeaf`（ホスト値を持たない or 葉のため
+            // 解放する意味がない）、多出力 payload を持つ演算
+            // （`LstmCell`／`LstmHidden`／`GruCell`／`QrQ`／`QrR`／
+            // `SvdU`／`SvdS`／`SvdVh`。兄弟出力が `Op` payload に直接
+            // 値を保持するため単純な入力再計算では閉じない）、resident
+            // 経路（`ResidentResolver` 前提の `LinearResident`）、その他
+            // 未対応の forward 経路（`LinearAct`／`MseLoss`／
+            // `CrossEntropyLoss`／`RnnCell`／`Inv`／`Solve`／`Det`／
+            // `Cholesky`／`MatrixNorm`／`Softmax`／`LogSoftmax`／
+            // `RmsNorm`／`LayerNorm`。merge 時に非網羅 match 是正で追加）は
+            // `docs/autodiff-checkpoint-design.md` §8 のスコープ外事項
+            // として未実装のまま保持する。
+            Op::Leaf
+            | Op::ResidentLeaf { .. }
+            | Op::LinearResident { .. }
+            | Op::LinearAct { .. }
+            | Op::MseLoss { .. }
+            | Op::CrossEntropyLoss { .. }
+            | Op::RnnCell { .. }
+            | Op::LstmCell { .. }
+            | Op::LstmHidden { .. }
+            | Op::GruCell { .. }
+            | Op::Inv { .. }
+            | Op::Solve { .. }
+            | Op::Det { .. }
+            | Op::Cholesky { .. }
+            | Op::QrQ { .. }
+            | Op::QrR { .. }
+            | Op::SvdU { .. }
+            | Op::SvdS { .. }
+            | Op::SvdVh { .. }
+            | Op::MatrixNorm { .. }
+            | Op::Softmax { .. }
+            | Op::LogSoftmax { .. }
+            | Op::RmsNorm { .. }
+            | Op::LayerNorm { .. } => false,
+        }
+    }
 }
 
 /// テープ上の 1 ノード。演算種別（`Op`）・構造的に確定する出力 shape・
@@ -737,6 +823,39 @@ pub(crate) struct TapeNode {
     pub(crate) shape: Vec<usize>,
     pub(crate) value: OnceCell<Tensor<f32>>,
     pub(crate) lazy_chain_size: usize,
+    /// activation checkpointing（イシュー #1624・`docs/
+    /// autodiff-checkpoint-design.md`）による解放後の再計算契約。`false`
+    /// （既定）は「未実体化なら真の契約違反」を意味する従来どおりの
+    /// 挙動。`Tape::checkpoint`／`Var::checkpoint_from` が
+    /// `Op::is_checkpoint_eligible()` なノードを解放（`value.take()`）
+    /// する際に `true` へ立てる——以後 `materialize_fallible`／
+    /// `materialize_non_fallible`／`lazy_leaf_value` は `is_view()` と
+    /// 同列に扱い、`recompute_fallible`／`recompute_infallible`
+    /// （本ファイル下部）で入力側から再導出する。view ノード
+    /// （`push_view`）は本フィールドに関わらず常にこの再導出経路へ
+    /// 分岐する（`Op::is_view` 判定が別途効くため）。
+    pub(crate) recompute: bool,
+    /// **P0 是正（codex-review 指摘。イシュー #1624 PR #1681 レビュー）**:
+    /// 層 2（[`materialize_non_fallible`]。`Var::value`/`Var::to_tensor`
+    /// が使う非 fallible 境界）は `&'a Tensor<f32>` を返す必要があり
+    /// `OnceCell` を必ず埋めるため、checkpoint 解放済みノードの再計算が
+    /// 真のバックエンド実行失敗（shape 不整合・カーネル起動失敗等。
+    /// 単なる view 不変条件違反ではない）を起こしても
+    /// `debug_assert! + safe_zeros` で吸収した結果を `OnceCell` へ
+    /// 「正常値」として永続キャッシュしてしまう——release ビルドでは
+    /// 誤りが一切検出できない構造的な穴だった。
+    ///
+    /// 本フィールド（`Cell<bool>`。`TapeNode` は `RefCell<Vec<..>>` の
+    /// 共有参照〈`&[TapeNode]`〉からしか触れないため内部可変性が必要）
+    /// は [`recompute_infallible`] が `recompute_value` から `Err` を
+    /// 受け取った際に `true` へ立て、以後 [`materialize_fallible`]
+    /// （層 1。`Tape::backward`／`grad.rs` の VJP が使う fallible 境界）
+    /// がこのノードのキャッシュ済み値を読む前に検査し、汚染済みなら
+    /// 黙って使わず `Err` として伝播する（`.claude/rules/coding-rust.md`
+    /// の本番経路での握り潰し禁止方針）。層 2 は契約上 infallible の
+    /// ままだが、層 1 経由（`Tape::backward`）で汚染を検出できるため
+    /// 「ゼロ勾配が静かに成功として返る」事故を防げる。
+    pub(crate) recompute_failed: std::cell::Cell<bool>,
 }
 
 /// 演算を記録する Wengert list。`Var`（`var.rs`）上の演算のみがここに
@@ -788,6 +907,31 @@ pub struct Tape {
     /// `None` の間は「まだ演算が始まっていない」ことを表し、[`Tape::reset`]
     /// は現在の全ノードを保持する（`leaf_count`/`reset` 参照）。
     retained_leaf_len: Cell<Option<usize>>,
+    /// activation checkpointing（イシュー #1624）が登録した解放済み区間
+    /// の一覧。`Tape::checkpoint`／`Var::checkpoint_from` が push し、
+    /// `backward_impl`（`backward.rs`）が逆走査中に `id == region.lo`
+    /// を処理し終えるたびに当該区間を再解放する（forward 時点の解放で
+    /// 空けたメモリを、backward の再計算後にもう一度空けるための帳
+    /// 簿。`docs/autodiff-checkpoint-design.md` §3.1 点 4）。`Tape::reset`
+    /// で消去する（区間は常に旧 epoch の葉プレフィックスより後ろにしか
+    /// 存在しないため、reset 後に stale な区間が残る余地はない）。
+    checkpoints: RefCell<Vec<CheckpointRegion>>,
+}
+
+/// activation checkpointing の 1 区間。ノード ID の閉区間
+/// `[lo, output]`（`Tape::checkpoint`／`Var::checkpoint_from` が push
+/// した時点で存在した全ノードを走査対象とする）のうち `output` を
+/// 除く `Op::is_checkpoint_eligible()` なノードが解放対象
+/// （`release_checkpoint_region` 参照）。
+#[derive(Debug, Clone, Copy)]
+struct CheckpointRegion {
+    /// 区間の先頭ノード ID（`Tape::checkpoint` 呼び出し直前の
+    /// `nodes.len()`。閉包が最初に push するノードの ID と一致する）。
+    lo: usize,
+    /// 区間の末尾ノード ID（closure が返した `Var` の `NodeId`）。
+    /// このノード自身は解放対象外——呼び出し元が戻り値として保持し
+    /// 続けるため、値なしにはできない。
+    output: usize,
 }
 
 impl std::fmt::Debug for Tape {
@@ -845,6 +989,7 @@ impl Tape {
             ops,
             epoch: Cell::new(0),
             retained_leaf_len: Cell::new(None),
+            checkpoints: RefCell::new(Vec::new()),
         }
     }
 
@@ -958,6 +1103,13 @@ impl Tape {
             .unwrap_or_else(|| self.nodes.get_mut().len());
         self.nodes.get_mut().truncate(keep);
         self.epoch.set(self.epoch.get() + 1);
+        // checkpoint 区間（イシュー #1624）は葉プレフィックスより後ろの
+        // ノードのみを指すため、上記 truncate で必ず区間の対象ノード
+        // ごと消える。区間一覧自体も消去し、次 epoch の新しい ID 空間に
+        // 対して古い区間が誤って再解放を試みないようにする（`&mut self`
+        // 経由のため `RefCell` を介さず直接クリアでき、実行中の借用が
+        // 残っていても二重借用 panic にはならない）。
+        self.checkpoints.get_mut().clear();
     }
 
     /// この `Tape` が保持する `ops`（バックエンド実行の必須所有値）への
@@ -965,6 +1117,125 @@ impl Tape {
     /// に使う。
     pub(crate) fn ops(&self) -> &dyn BackendOps {
         self.ops.as_ref()
+    }
+
+    /// activation checkpointing（イシュー #1624）: `f` を実行して得た
+    /// `Var` を「区間の出力」として、`f` が新規に push したノードのうち
+    /// `Op::is_checkpoint_eligible()` なもの（`output` 自身を除く）の
+    /// forward 値を即座に解放する。以後その値は backward が実際に必要と
+    /// した時点で入力側から再計算される（`recompute_fallible`／
+    /// `recompute_infallible`。`docs/autodiff-checkpoint-design.md`）。
+    ///
+    /// `f` が `Err` を返した場合はテープの状態（push 済みノードを含む）
+    /// をそのまま伝播し、**何も解放しない**——部分的に解放された
+    /// テープを後続処理に渡すと、`f` の失敗と無関係な既存ノードの解放
+    /// 状態が変わってしまい呼び出し元の期待と食い違うため（`out-of-
+    /// scope-tracking.md` の「スコープ外の修正を混入させない」と同じ
+    /// 「意図しない副作用を残さない」精神）。
+    ///
+    /// 区間が空（`f` が新規ノードを 1 つも push せず、テープ先頭側の
+    /// 既存ノードをそのまま返した場合）は no-op で `output` をそのまま
+    /// 返す（解放対象がないため）。
+    pub fn checkpoint<'t, F>(&'t self, f: F) -> Result<crate::var::Var<'t>, AutodiffError>
+    where
+        F: FnOnce() -> Result<crate::var::Var<'t>, AutodiffError>,
+    {
+        let lo = self.nodes.borrow().len();
+        let output = f()?;
+        if output.tape_id() != self.id {
+            return Err(AutodiffError::TapeMismatch);
+        }
+        let output_id = output.node_id().0;
+        if output_id < lo {
+            // 区間が空: `f` が新規ノードを push しなかった（既存ノードを
+            // そのまま返した）。解放対象がないため no-op。
+            return Ok(output);
+        }
+        self.register_checkpoint(lo, output_id)?;
+        Ok(output)
+    }
+
+    /// [`Tape::checkpoint`]／[`crate::var::Var::checkpoint_from`] の共通
+    /// 登録処理。区間 `[lo, output]`（`output` を除く）を即座に解放し、
+    /// 区間一覧（`checkpoints`）へ追記する（backward 側の再解放
+    /// `release_after_backward_step` が参照する）。
+    ///
+    /// `try_borrow_mut` を使う理由: 呼び出し時点で `self.nodes` の
+    /// `Ref`/`RefMut` が生存していると（誤用・将来の呼び出し経路の
+    /// 変更により）`borrow_mut()` は panic するが、本番経路 panic
+    /// 禁止方針（`.claude/rules/coding-rust.md`）に従い型付きエラーへ
+    /// 変換して fail-closed に拒否する。
+    pub(crate) fn register_checkpoint(
+        &self,
+        lo: usize,
+        output: usize,
+    ) -> Result<(), AutodiffError> {
+        {
+            let mut nodes = self.nodes.try_borrow_mut().map_err(|_| {
+                AutodiffError::InvalidArgument(
+                    "Tape::register_checkpoint: nodes への排他借用に失敗した（他の借用が生存中）"
+                        .into(),
+                )
+            })?;
+            release_checkpoint_region(&mut nodes, lo, output);
+        }
+        self.checkpoints
+            .borrow_mut()
+            .push(CheckpointRegion { lo, output });
+        Ok(())
+    }
+
+    /// backward の逆走査（`backward_impl`）が `id` の処理を終えた直後に
+    /// 呼ぶ（イシュー #1624）。`id` がいずれかの登録済み区間の `lo`
+    /// （区間の先頭ノード）と一致する場合、その区間を**再解放**する
+    /// （forward 直後の解放で空けたメモリを、backward が再計算した後に
+    /// もう一度空ける。`docs/autodiff-checkpoint-design.md` §3.1 点 4）。
+    ///
+    /// **`id == lo` を境界に使える理由**: `backward_impl` はノード ID
+    /// 降順に単一パスで走査するため、`id == lo` を処理し終えた時点で
+    /// `[lo, output)` 内のどのノードも二度と読まれない（DAG の
+    /// トポロジカル順序上、ID が `lo` 未満のノードが `[lo, output)` 内の
+    /// ノードへ依存することはあり得ない）。
+    ///
+    /// `nodes` は呼び出し元（`backward_impl`）が同一反復内で既に
+    /// 不変借用（`Ref`）を drop 済みであることを前提に `borrow_mut()`
+    /// する契約（`backward_impl` のループ構造 doc 参照）。
+    ///
+    /// **`try_borrow_mut` を使う理由（P1 是正・codex-review 指摘。
+    /// イシュー #1624 PR レビュー）**: 上記契約は `backward_impl`
+    /// 自身の借用規律には従うが、`Tape::backward` の**呼び出し元**が
+    /// `loss.value()`（`Ref<'_, Tensor<f32>>`）を保持したまま
+    /// `tape.backward(&loss)` を呼ぶケースまでは防げない
+    /// （`register_checkpoint` が既に `try_borrow_mut` で同様に対処
+    /// している外部借用と同じ問題）。checkpoint 機能追加前は
+    /// `backward_impl` が `nodes` の可変借用を一切要求しなかったため
+    /// このケースでも panic しなかったが、本関数の追加により
+    /// `borrow_mut()` が実行時 panic するようになった。`.claude/rules/
+    /// coding-rust.md` の本番経路 panic 禁止方針に従い、`try_borrow_mut`
+    /// で失敗を検出し型付きエラーとして呼び出し元（`backward_impl`）へ
+    /// 伝播する。
+    pub(crate) fn release_checkpoints_ending_at(&self, id: usize) -> Result<(), AutodiffError> {
+        let regions: Vec<CheckpointRegion> = self
+            .checkpoints
+            .borrow()
+            .iter()
+            .filter(|r| r.lo == id)
+            .copied()
+            .collect();
+        if regions.is_empty() {
+            return Ok(());
+        }
+        let mut nodes = self.nodes.try_borrow_mut().map_err(|_| {
+            AutodiffError::InvalidArgument(
+                "Tape::release_checkpoints_ending_at: nodes への排他借用に失敗した\
+                 （`Var::value()` 等で取得した `Ref` が backward 呼び出し中も生存している）"
+                    .into(),
+            )
+        })?;
+        for region in regions {
+            release_checkpoint_region(&mut nodes, region.lo, region.output);
+        }
+        Ok(())
     }
 
     /// **非 elementwise・常に実体化済み**のノードを追記する（`matmul`/
@@ -992,6 +1263,8 @@ impl Tape {
             shape,
             value: OnceCell::from(value),
             lazy_chain_size: 0,
+            recompute: false,
+            recompute_failed: std::cell::Cell::new(false),
         });
         id
     }
@@ -1016,6 +1289,8 @@ impl Tape {
             shape,
             value: OnceCell::new(),
             lazy_chain_size: 0,
+            recompute: false,
+            recompute_failed: std::cell::Cell::new(false),
         });
         id
     }
@@ -1043,6 +1318,8 @@ impl Tape {
             shape,
             value: OnceCell::new(),
             lazy_chain_size: 0,
+            recompute: false,
+            recompute_failed: std::cell::Cell::new(false),
         });
         id
     }
@@ -1120,6 +1397,8 @@ impl Tape {
             shape,
             value: OnceCell::new(),
             lazy_chain_size: size,
+            recompute: false,
+            recompute_failed: std::cell::Cell::new(false),
         });
         (id, at_limit)
     }
@@ -1218,8 +1497,9 @@ impl Tape {
 /// 有界化されている。
 fn build_lazy_plan(
     nodes: &[TapeNode],
+    backend_ops: &dyn BackendOps,
     id: NodeId,
-) -> Result<(FusionPlan, Vec<Tensor<f32>>, NodeId), BackendError> {
+) -> Result<(FusionPlan, Vec<Tensor<f32>>, NodeId), AutodiffError> {
     use std::collections::HashMap;
 
     let mut reachable: HashMap<usize, ()> = HashMap::new();
@@ -1333,13 +1613,53 @@ fn build_lazy_plan(
     }
 
     let output_shape = nodes[id.0].shape.clone();
+    // **P0 是正（codex-review・Cursor Bugbot 指摘。イシュー #1624 PR
+    // レビュー）**: 旧実装は `lazy_leaf_value`（infallible。バックエンド
+    // エラーを debug_assert + ゼロ埋めへ吸収する層 2 専用ヘルパー）を
+    // 層 1（`materialize_fallible` 経由）からも呼んでいたため、
+    // checkpoint 解放済み葉（`node.recompute == true`）の再計算が
+    // バックエンドエラー（shape 不整合・カーネル起動失敗等）を起こすと
+    // release ビルドでは検出されずゼロテンソルへ静かに置換され、
+    // 呼び出し元には「成功」として伝わってしまっていた（fail-open）。
+    // 層 1 はここで `lazy_leaf_value_fallible`（fallible）を使い、
+    // 葉ごとの再計算失敗をそのまま `Result` として呼び出し元へ伝播する。
+    // 共有祖先の重複再計算を避けるための `memo`（イシュー #1624 review
+    // 指摘: 共有祖先の O(2^n) 再計算対策）はこの `leaf_order` 全体で
+    // 1 個だけ確保し、複数の葉が同じ checkpoint 解放済み祖先を参照する
+    // ケースでも祖先の再計算が高々 1 回で済むようにする。
+    let mut recompute_memo: HashMap<usize, Tensor<f32>> = HashMap::new();
     let leaves: Vec<Tensor<f32>> = leaf_order
         .iter()
-        .map(|&n| lazy_leaf_value(nodes, n))
-        .collect();
+        .map(|&n| lazy_leaf_value_fallible(nodes, backend_ops, n, &mut recompute_memo))
+        .collect::<Result<Vec<_>, AutodiffError>>()?;
 
-    let plan = FusionPlan::from_ops(ops, output_shape, DType::F32, leaf_count)?;
+    let plan = FusionPlan::from_ops(ops, output_shape, DType::F32, leaf_count)
+        .map_err(|err| AutodiffError::from(BackendError::from(err)))?;
     Ok((plan, leaves, id))
+}
+
+/// activation checkpointing（イシュー #1624）: 区間 `[lo, output)`
+/// （`output` 自身は含めない）に含まれる [`Op::is_checkpoint_eligible`]
+/// なノードの forward 値を解放し（`OnceCell::take`）、`recompute` フラグ
+/// を立てる。[`Tape::register_checkpoint`]（forward 直後の初回解放）と
+/// [`Tape::release_checkpoints_ending_at`]（backward の再解放）の両方
+/// から呼ばれる共通ロジック。
+///
+/// **呼び出し契約**: 呼び出し時点で他に生存する `Ref`/`RefMut` が
+/// ないこと（呼び出し元がそれぞれ `try_borrow_mut`／`borrow_mut` で
+/// 排他アクセスを確保してから渡す）。
+///
+/// 既に解放済み（`value.get().is_none()` かつ `recompute == true`）の
+/// ノードへ再度呼んでも副作用はない（`OnceCell::take` は空なら
+/// `None` を返すのみ）——`checkpoint_from` の入れ子区間（内側区間が
+/// 先に解放したノードを外側区間が再度走査する場合）を単純に許容する。
+fn release_checkpoint_region(nodes: &mut [TapeNode], lo: usize, output: usize) {
+    for node in nodes.iter_mut().take(output).skip(lo) {
+        if node.op.is_checkpoint_eligible() {
+            node.value.take();
+            node.recompute = true;
+        }
+    }
 }
 
 /// `node.shape` から全要素 `0.0` のテンソルを構築する安全側フォール
@@ -1399,11 +1719,11 @@ fn unreachable_op_kind() -> FusedOpKind {
 /// 実体化された後は同じ `OnceCell` に結果がキャッシュされるため、本関数
 /// が `resolve_view` へ分岐するのは未実体化のまま到達した場合のみ
 /// （`Op::Reshape` doc 参照）。
-fn lazy_leaf_value(nodes: &[TapeNode], n: usize) -> Tensor<f32> {
+fn lazy_leaf_value(nodes: &[TapeNode], ops: &dyn BackendOps, n: usize) -> Tensor<f32> {
     let node = &nodes[n];
     match node.value.get() {
         Some(t) => t.clone(),
-        None if node.op.is_view() => resolve_view(nodes, NodeId(n)),
+        None if node.op.is_view() || node.recompute => recompute_infallible(nodes, ops, NodeId(n)),
         None => {
             debug_assert!(
                 false,
@@ -1414,68 +1734,128 @@ fn lazy_leaf_value(nodes: &[TapeNode], n: usize) -> Tensor<f32> {
     }
 }
 
-/// view ノード（[`Op::Reshape`]/[`Op::Transpose`]。イシュー #1047）を
-/// 入力側へ再帰的に辿り、最初に実体化済み（`value.get().is_some()`）な
-/// ノードの値へ `reshape`/`transpose` を順に適用して再導出する
-/// （burn-autodiff の `retro_forward` 相当）。`push_view` の呼び出し
-/// 契約（`input` は push 前に層 1で実体化済み）により通常は 1 段の
-/// 再帰で終わるが、view の view（例: `x.transpose(0,1)?.reshape(..)?`）
-/// にも構造的に対応するため再帰実装とする。
+/// view ノード（[`Op::Reshape`]/[`Op::Transpose`]。イシュー #1047）と
+/// activation checkpointing（イシュー #1624）で解放された
+/// （`TapeNode::recompute == true`）ノードを、入力側へ再帰的に辿って
+/// 再導出する（burn-autodiff の `retro_forward` 相当を、view 限定から
+/// `Op::is_checkpoint_eligible()` な eager ノード全般へ一般化したもの。
+/// `docs/autodiff-checkpoint-design.md` §3.4）。
 ///
-/// **`Arc` 共有のみ・バッファは確保しない**: `Tensor::reshape`／
-/// `transpose` はいずれも既存 `storage: Arc<Storage>` を `Arc::clone`
-/// するだけの zero-copy view 演算（`tensor-core/src/tensor.rs`）で
-/// あり、本関数はそれらを合成するだけなので新規ヒープ確保を伴わない
-/// （`tests/view_zero_alloc.rs` が機械的に検証する）。
+/// **forward と bit 同一である理由**: 各分岐は `Var::matmul`／
+/// `sigmoid`／`sum`／`max`（`var.rs`）が forward 時に呼ぶのと**同じ**
+/// `ops`／`eval` メソッド呼び出しをそのまま再現する（同一 CPU BLIS／
+/// CUDA／Metal カーネル・同一 FMA 契約。`.claude/rules/
+/// coding-rust.md`）ため、再計算値は初回計算値と bit 同一になる。
 ///
-/// **infallible な理由**: `Var::reshape`/`transpose`（`var.rs`）が push
-/// 時点で shape・軸範囲を検査済みのため、ここでの `reshape`/`transpose`
-/// 呼び出しは構造的に失敗しえない。それでも本番経路 panic 禁止方針
-/// （`.claude/rules/coding-rust.md`）のため、`Err` 分岐は
-/// `debug_assert!` + 安全側フォールバック（全要素 `0.0`）に吸収する
-/// （到達すれば forward 側の shape 検査ロジックにバグがある）。
-fn resolve_view(nodes: &[TapeNode], id: NodeId) -> Tensor<f32> {
-    let node = &nodes[id.0];
-    if let Some(v) = node.value.get() {
-        return v.clone();
+/// **再帰の終端**: `push_view`／checkpoint 解放のいずれも「入力は
+/// 呼び出し時点で実体化済み、または同じくこの経路で再導出可能」の
+/// いずれかであることを前提にする（`push_view` の事前実体化契約・
+/// `Op::is_checkpoint_eligible()` が入力ノードを含む区間全体を対象に
+/// 走査する構造）。両条件が破られる（非適格な Op が未実体化のまま
+/// 到達する）のは真の契約違反であり、`Err` として呼び出し元
+/// （[`recompute_infallible`]）へ吸収させる。
+///
+/// **P0 是正（codex-review 指摘。イシュー #1624 PR #1681 レビュー）**:
+/// `TapeNode::recompute_failed` が立っている（層 2
+/// `materialize_non_fallible` がこのノードの再計算失敗をゼロ埋めへ
+/// 吸収した実績がある）場合、キャッシュ済み値を「正しい実体化結果」
+/// として信頼せず `Err` を返す。呼び出し元（[`recompute_value`]・
+/// [`materialize_fallible`]・[`lazy_leaf_value_fallible`]・
+/// `value_of`（fallible 版）の 4 箇所すべて）はこのノードのキャッシュ
+/// 済み値を読む前に本関数で検査する契約とする。
+fn poisoned_err(node: &TapeNode) -> Result<(), AutodiffError> {
+    if node.recompute_failed.get() {
+        return Err(AutodiffError::Backward(
+            "materialize: checkpoint 解放済みノードの再計算が過去にバックエンド実行失敗を\
+             起こしており、キャッシュ済み値は信頼できない（TapeNode::recompute_failed）"
+                .into(),
+        ));
     }
-    match &node.op {
+    Ok(())
+}
+
+fn recompute_value(
+    nodes: &[TapeNode],
+    ops: &dyn BackendOps,
+    id: NodeId,
+    memo: &mut std::collections::HashMap<usize, Tensor<f32>>,
+) -> Result<Tensor<f32>, AutodiffError> {
+    if let Some(v) = nodes[id.0].value.get() {
+        // **P0 是正（codex-review 指摘。イシュー #1624 PR #1681
+        // レビュー）**: この `OnceCell` の中身は層 2
+        // （`materialize_non_fallible`）が `recompute_infallible` の
+        // 失敗を握り潰して詰めたゼロ埋め値かもしれない
+        // （`TapeNode::recompute_failed` doc 参照）。ここで無条件に
+        // 「既に実体化済みの正しい値」として使うと、祖先の再計算失敗が
+        // 静かに伝播してしまう——`Err` として呼び出し元へ伝播する。
+        return poisoned_err(&nodes[id.0]).map(|()| v.clone());
+    }
+    // **P1 是正（codex-review 指摘・イシュー #1624 PR レビュー）**:
+    // checkpoint 区間内の DAG が共有祖先を持つ場合（例:
+    // `h = h.matmul(&h)` を n 回繰り返す構造）、`memo` なしでは左右の
+    // 入力（`Op::MatMul(a, b)` の `a`／`b` が同一 `NodeId` を指す等）を
+    // 独立に再帰評価してしまい、共有部分木の再計算回数が呼び出し段数に
+    // 対して指数的に増える（O(2^n) の GEMM 再計算）。`memo` に
+    // 一度計算した `NodeId` を記録し、以後の参照はそこから引くことで
+    // 同一 `recompute_value` 呼び出し木の中では各ノードを高々 1 回しか
+    // 再計算しないようにする。
+    if let Some(v) = memo.get(&id.0) {
+        return Ok(v.clone());
+    }
+    let node = &nodes[id.0];
+    let value = match &node.op {
         Op::Reshape { input } => {
-            let base = resolve_view(nodes, *input);
-            base.reshape(&node.shape).unwrap_or_else(|_| {
-                debug_assert!(
-                    false,
-                    "resolve_view: Op::Reshape の再導出が失敗した（forward 側の契約違反）"
-                );
-                safe_zeros(&node.shape)
-            })
+            let base = recompute_value(nodes, ops, *input, memo)?;
+            base.reshape(&node.shape)?
         }
         Op::Transpose { input, dim0, dim1 } => {
-            let base = resolve_view(nodes, *input);
-            base.transpose(*dim0, *dim1).unwrap_or_else(|_| {
-                debug_assert!(
-                    false,
-                    "resolve_view: Op::Transpose の再導出が失敗した（forward 側の契約違反）"
-                );
-                safe_zeros(&node.shape)
-            })
+            let base = recompute_value(nodes, ops, *input, memo)?;
+            base.transpose(*dim0, *dim1)?
+        }
+        Op::MatMul(a, b) => {
+            // `Var::matmul` と同じ `ops.gemm` 呼び出し（`var.rs`
+            // `Var::matmul` doc 参照）。
+            let a_val = recompute_value(nodes, ops, *a, memo)?;
+            let b_val = recompute_value(nodes, ops, *b, memo)?;
+            ops.gemm(&a_val, &b_val)?
+        }
+        Op::Sigmoid(a) => {
+            // `Var::sigmoid` と同じ `eval::sigmoid` 呼び出し（`ops` に
+            // 対応メソッドがないため融合対象外。`tape::Op::Sigmoid`
+            // doc 参照）。
+            let a_val = recompute_value(nodes, ops, *a, memo)?;
+            crate::eval::sigmoid(&a_val)
+        }
+        Op::Sum { input, dim } => {
+            let input_val = recompute_value(nodes, ops, *input, memo)?;
+            ops.sum(&input_val, *dim)?
+        }
+        Op::Max { input, dim } => {
+            let input_val = recompute_value(nodes, ops, *input, memo)?;
+            ops.max(&input_val, *dim)?
         }
         Op::Permute { input, perm } => {
-            let base = resolve_view(nodes, *input);
+            // イシュー #1597 で `push_view` 経由の view 系ノードへ追加
+            // された variant。当時の再導出関数名 `resolve_view`
+            // （infallible）はイシュー #1624 で `recompute_value`
+            // （checkpoint 全般へ一般化した fallible 版）へ改称された
+            // ため、`?` で伝播するよう揃える（merge 時の呼び出し名
+            // 不整合の是正。review 指摘）。
+            let base = recompute_value(nodes, ops, *input, memo)?;
             base.permute(perm).unwrap_or_else(|_| {
                 debug_assert!(
                     false,
-                    "resolve_view: Op::Permute の再導出が失敗した（forward 側の契約違反）"
+                    "recompute_value: Op::Permute の再導出が失敗した（forward 側の契約違反）"
                 );
                 safe_zeros(&node.shape)
             })
         }
         Op::BroadcastTo { input } => {
-            let base = resolve_view(nodes, *input);
+            let base = recompute_value(nodes, ops, *input, memo)?;
             base.broadcast_to(&node.shape).unwrap_or_else(|_| {
                 debug_assert!(
                     false,
-                    "resolve_view: Op::BroadcastTo の再導出が失敗した（forward 側の契約違反）"
+                    "recompute_value: Op::BroadcastTo の再導出が失敗した（forward 側の契約違反）"
                 );
                 safe_zeros(&node.shape)
             })
@@ -1486,24 +1866,162 @@ fn resolve_view(nodes: &[TapeNode], id: NodeId) -> Tensor<f32> {
             start,
             len,
         } => {
-            let base = resolve_view(nodes, *input);
+            let base = recompute_value(nodes, ops, *input, memo)?;
             base.narrow(*dim, *start, *len).unwrap_or_else(|_| {
                 debug_assert!(
                     false,
-                    "resolve_view: Op::Narrow の再導出が失敗した（forward 側の契約違反）"
+                    "recompute_value: Op::Narrow の再導出が失敗した（forward 側の契約違反）"
                 );
                 safe_zeros(&node.shape)
             })
         }
         _ => {
-            // `push_view` の呼び出し契約（`input` は事前実体化済み）に
-            // より、非 view ノードが未実体化のままここへ渡ることはない。
-            // 到達すれば契約違反であり、安全側フォールバックで吸収する。
+            // `Op::is_checkpoint_eligible()` が解放しない Op、かつ
+            // view でもないノードが未実体化のままここへ渡ることは
+            // 構造上あり得ない（`push_view` の事前実体化契約・
+            // checkpoint 解放が eligible なノードにしか `recompute` を
+            // 立てないため）。到達すれば契約違反であり、安全側
+            // フォールバックへ吸収する呼び出し元に委ねるため `Err` を
+            // 返す。
+            return Err(AutodiffError::Backward(format!(
+                "recompute_value: 再計算対象外の Op（node {}）が未実体化のまま到達した（契約違反）",
+                id.0
+            )));
+        }
+    };
+    memo.insert(id.0, value.clone());
+    Ok(value)
+}
+
+/// [`recompute_value`] の fallible ラッパー。`id` **自身**の
+/// `OnceCell` へ結果をキャッシュする（`materialize_fallible` の
+/// is_view/recompute 分岐から呼ばれる。層 1 は `OnceCell::
+/// get_or_init` を使わないため、明示的な `set` がここで安全に行える）。
+///
+/// **`recompute_value` 自身は途中の祖先ノードを一切キャッシュしない**
+/// （`resolve_view`〈旧実装〉と同じ「純粋な再帰計算」契約。`Op::Reshape`/
+/// `Op::Transpose` 用の再帰呼び出しも `recompute_value` を直接呼ぶ）。
+/// これは [`materialize_non_fallible`] の `get_or_init` クロージャ内から
+/// 同じ `id` に対して `recompute_infallible`（下記）を呼ぶ経路が存在
+/// するため意図的な設計判断である——もし `recompute_value` の内部で
+/// `id` 自身の `OnceCell::set` を呼んでしまうと、`get_or_init` が
+/// 自身のクロージャ実行中に同じセルへの書き込みを検出して
+/// `reentrant init` で panic する（`std::cell::OnceCell` の契約）。
+/// 祖先を毎回再計算し直す性能面のトレードオフは `docs/
+/// autodiff-checkpoint-design.md` §8 のスコープ外事項として記録する。
+fn recompute_fallible(
+    nodes: &[TapeNode],
+    ops: &dyn BackendOps,
+    id: NodeId,
+) -> Result<Tensor<f32>, AutodiffError> {
+    // `id` 単体の再計算であり、他の実体化呼び出しと祖先を共有する
+    // 前提を置かないため、`memo` はこの呼び出し内限定で新規に確保する
+    // （共有祖先の重複再計算対策は `recompute_value` 内部の再帰で
+    // 完結する。`build_lazy_plan`／`fallback_per_op` のように複数の
+    // 葉にまたがる場合は呼び出し元が `memo` を共有する）。
+    let mut memo = std::collections::HashMap::new();
+    let value = recompute_value(nodes, ops, id, &mut memo)?;
+    match nodes[id.0].value.set(value) {
+        Ok(()) => {}
+        Err(_rejected) => { /* fan-out 二重到達: 既存値を正として使う */ }
+    }
+    nodes[id.0].value.get().cloned().ok_or_else(|| {
+        AutodiffError::Backward(
+            "recompute_fallible: OnceCell 不変条件違反（set 直後に get が None を返した）".into(),
+        )
+    })
+}
+
+/// [`recompute_value`] の infallible ラッパー。`resolve_view`（旧実装）
+/// の契約（本番経路 panic 禁止・失敗時は `debug_assert!` + ゼロ埋め
+/// フォールバック）をそのまま踏襲する。
+///
+/// **`id` 自身をキャッシュしない**（`recompute_fallible` との違い）:
+/// `materialize_non_fallible` の `get_or_init` クロージャから同じ `id`
+/// に対して呼ばれるため、ここで `id` 自身の `OnceCell` へ触れると
+/// reentrant init panic になる（`recompute_fallible` doc 参照）。
+/// `lazy_leaf_value` から異なる（祖先）`id` に対して呼ばれる経路は
+/// この制約と無関係だが、実装を一本化するため同じ非キャッシュ契約を
+/// 適用する。
+///
+/// **P0 是正（codex-review 指摘。イシュー #1624 PR #1681 レビュー）**:
+/// `recompute_value` からの `Err` は「構造的な view 不変条件違反」
+/// （本来あり得ない契約違反）と「真のバックエンド実行失敗」（shape
+/// 不整合・カーネル起動失敗等。checkpoint 解放済みノードの再計算では
+/// 現実に起こりうる）を区別しない一つの経路だが、いずれの場合も
+/// `id`（呼び出し元。`materialize_non_fallible` の `get_or_init` が
+/// 埋めようとしているノード自身）の `TapeNode::recompute_failed` を
+/// `true` へ立てる。これにより層 2 は契約どおり `Tensor<f32>`
+/// （ゼロ埋めフォールバック）を返しつつ、汚染の事実を消さずに記録する。
+/// 以後 [`materialize_fallible`]（層 1）がこのノードを読む前に
+/// `recompute_failed` を検査し、汚染済みなら `Err` として伝播する
+/// （層 2 だけでは検出できない誤りを層 1 経由〈`Tape::backward`〉で
+/// 確実に検出可能にする）。
+///
+/// **`debug_assert!` を使わない理由**: checkpoint 解放済みノードの
+/// 再計算失敗は（`resolve_view`〈旧実装〉が想定していた「あり得ない
+/// 構造的契約違反」とは異なり）現実のバックエンド実行失敗
+/// （shape 不整合・カーネル起動失敗等）として普通に起こりうる。
+/// `debug_assert!(false)` を残すとテスト・debug ビルドでこの正常系
+/// フォールバック（poison 記録 + ゼロ埋め）自体が panic してしまい、
+/// 上記の poison 契約を exercise できない。真の契約違反（`push_view`／
+/// `is_checkpoint_eligible` の前提が破られる等）は `recompute_value`
+/// 自身が `Err` を返す時点で `AutodiffError::Backward` にメッセージが
+/// 残るため、ここでの `debug_assert!` は情報の重複でしかない。
+fn recompute_infallible(nodes: &[TapeNode], ops: &dyn BackendOps, id: NodeId) -> Tensor<f32> {
+    let mut memo = std::collections::HashMap::new();
+    recompute_value(nodes, ops, id, &mut memo).unwrap_or_else(|_| {
+        nodes[id.0].recompute_failed.set(true);
+        safe_zeros(&nodes[id.0].shape)
+    })
+}
+
+/// [`lazy_leaf_value`] の fallible 版（イシュー #1624 PR レビューの
+/// P0 是正）。`build_lazy_plan`（層 1）・`fallback_per_op`（層 1／層 2
+/// 共用）の葉参照から呼ばれる。checkpoint 解放済み祖先（`node.recompute
+/// == true`）／view ノードの再計算に失敗した場合、旧 `lazy_leaf_value`
+/// のように `debug_assert!` + ゼロ埋めへ静かに吸収せず `Err` をそのまま
+/// 呼び出し元へ伝播する——`build_lazy_plan` は `materialize_fallible`
+/// （層 1・`Result` を返す公開契約）から呼ばれるため、ここで失敗を
+/// 握り潰すと release ビルドでバックエンドエラーがゼロテンソルへ
+/// 変換され「成功」として伝わってしまう（fail-open。codex-review・
+/// Cursor Bugbot 指摘）。
+///
+/// `recompute_memo` は呼び出し元（`build_lazy_plan` の leaf_order 走査・
+/// `fallback_per_op` の interior 走査）全体で共有する想定の引数であり、
+/// 複数の葉／interior ノードが同じ checkpoint 解放済み祖先を参照する
+/// ケースでも祖先の再計算が高々 1 回で済むようにする（review 指摘:
+/// 共有祖先の O(2^n) 再計算対策）。
+fn lazy_leaf_value_fallible(
+    nodes: &[TapeNode],
+    ops: &dyn BackendOps,
+    n: usize,
+    recompute_memo: &mut std::collections::HashMap<usize, Tensor<f32>>,
+) -> Result<Tensor<f32>, AutodiffError> {
+    let node = &nodes[n];
+    match node.value.get() {
+        Some(t) => {
+            // `poisoned_err` doc 参照（P0 是正・イシュー #1624 PR
+            // #1681 レビュー）。
+            poisoned_err(node)?;
+            Ok(t.clone())
+        }
+        None if node.op.is_view() || node.recompute => {
+            recompute_value(nodes, ops, NodeId(n), recompute_memo)
+        }
+        None => {
+            // `lazy_leaf_value`（層 2 専用の infallible 版）と同じ
+            // 契約違反フォールバック（真の契約違反であり、checkpoint
+            // 解放済みノードの再計算失敗とは異なる事象。詳細は
+            // `lazy_leaf_value` doc 参照）。層 1 でもこの分岐は構造上
+            // 到達しないはずだが、到達した場合に備えて同じ安全側
+            // フォールバックを維持する（バックエンド実行を伴わないため
+            // fail-open の懸念はここには当てはまらない）。
             debug_assert!(
                 false,
-                "resolve_view: 非 view ノードへ到達した（契約違反。push_view の事前実体化契約が破られた）"
+                "lazy_leaf_value_fallible: 実体化済みのはずのノードが未実体化だった（契約違反）"
             );
-            safe_zeros(&node.shape)
+            Ok(safe_zeros(&node.shape))
         }
     }
 }
@@ -1518,7 +2036,7 @@ fn fallback_per_op(
     nodes: &[TapeNode],
     ops: &dyn BackendOps,
     id: NodeId,
-) -> Result<Tensor<f32>, BackendError> {
+) -> Result<Tensor<f32>, AutodiffError> {
     use std::collections::HashMap;
 
     // `build_lazy_plan` と同じ走査で interior（未実体化 elementwise の
@@ -1550,37 +2068,79 @@ fn fallback_per_op(
     interior.reverse();
 
     let mut computed: HashMap<usize, Tensor<f32>> = HashMap::new();
-    let value_of = |n: usize, computed: &HashMap<usize, Tensor<f32>>| -> Tensor<f32> {
-        if let Some(t) = nodes[n].value.get() {
-            t.clone()
-        } else {
-            computed
-                .get(&n)
-                .cloned()
-                .unwrap_or_else(|| lazy_leaf_value(nodes, n))
-        }
-    };
+    // **P0 是正（codex-review・Cursor Bugbot 指摘。イシュー #1624 PR
+    // レビュー）**: `fallback_per_op` は `materialize_fallible`（層 1）
+    // からも呼ばれる（`run_fused` が `Unsupported`／`ShapeMismatch` を
+    // 返した場合のフォールバック経路）ため、旧実装の `lazy_leaf_value`
+    // （infallible）呼び出しは `build_lazy_plan` と同じ fail-open 経路に
+    // なっていた。`lazy_leaf_value_fallible` へ切り替え、失敗を `Result`
+    // として伝播する。`recompute_memo` は本関数の呼び出し全体で共有し、
+    // 複数の interior ノードが同じ checkpoint 解放済み祖先を参照する
+    // ケースでも祖先の再計算が高々 1 回で済むようにする（review 指摘:
+    // 共有祖先の O(2^n) 再計算対策）。
+    let mut recompute_memo: HashMap<usize, Tensor<f32>> = HashMap::new();
     for &cur in &interior {
         let result = match &nodes[cur].op {
-            Op::Add(a, b) => ops.add(&value_of(a.0, &computed), &value_of(b.0, &computed))?,
-            Op::Mul(a, b) => ops.mul(&value_of(a.0, &computed), &value_of(b.0, &computed))?,
-            Op::Relu(a) => ops.relu(&value_of(a.0, &computed))?,
-            Op::Exp(a) => ops.exp(&value_of(a.0, &computed))?,
-            Op::Tanh(a) => ops.tanh(&value_of(a.0, &computed))?,
+            Op::Add(a, b) => {
+                let a_val = value_of(nodes, ops, a.0, &computed, &mut recompute_memo)?;
+                let b_val = value_of(nodes, ops, b.0, &computed, &mut recompute_memo)?;
+                ops.add(&a_val, &b_val)?
+            }
+            Op::Mul(a, b) => {
+                let a_val = value_of(nodes, ops, a.0, &computed, &mut recompute_memo)?;
+                let b_val = value_of(nodes, ops, b.0, &computed, &mut recompute_memo)?;
+                ops.mul(&a_val, &b_val)?
+            }
+            Op::Relu(a) => {
+                let a_val = value_of(nodes, ops, a.0, &computed, &mut recompute_memo)?;
+                ops.relu(&a_val)?
+            }
+            Op::Exp(a) => {
+                let a_val = value_of(nodes, ops, a.0, &computed, &mut recompute_memo)?;
+                ops.exp(&a_val)?
+            }
+            Op::Tanh(a) => {
+                let a_val = value_of(nodes, ops, a.0, &computed, &mut recompute_memo)?;
+                ops.tanh(&a_val)?
+            }
             _ => continue,
         };
         computed.insert(cur, result);
     }
 
-    computed.get(&id.0).cloned().map(Ok).unwrap_or_else(|| {
-        // interior が空（`id` が既に実体化済みだった呼び出し）の場合は
-        // 呼び出し元が別途処理する契約のため、通常この分岐には来ない。
-        Ok(nodes[id.0]
-            .value
-            .get()
-            .cloned()
-            .unwrap_or_else(|| safe_zeros(&nodes[id.0].shape)))
-    })
+    if let Some(t) = computed.get(&id.0) {
+        return Ok(t.clone());
+    }
+    // interior が空（`id` が既に実体化済みだった呼び出し）の場合は
+    // 呼び出し元が別途処理する契約のため、通常この分岐には来ない。
+    // それでも到達した場合に備え、`lazy_leaf_value_fallible` と同じ
+    // fallible 経路で `id` 自身を解決する（旧実装のゼロ埋め黙殺は
+    // 層 1 の fail-open につながるため使わない）。
+    value_of(nodes, ops, id.0, &computed, &mut recompute_memo)
+}
+
+/// [`fallback_per_op`] の葉参照ヘルパー。実体化済みノード・同一呼び出し
+/// 内で既に計算済みの interior ノード（`computed`）・それ以外（未実体化
+/// の view／checkpoint 解放済み祖先）の順で解決し、最後のケースのみ
+/// [`lazy_leaf_value_fallible`] （fallible・`recompute_memo` 共有）へ
+/// 委譲する。
+fn value_of(
+    nodes: &[TapeNode],
+    ops: &dyn BackendOps,
+    n: usize,
+    computed: &std::collections::HashMap<usize, Tensor<f32>>,
+    recompute_memo: &mut std::collections::HashMap<usize, Tensor<f32>>,
+) -> Result<Tensor<f32>, AutodiffError> {
+    if let Some(t) = nodes[n].value.get() {
+        // `poisoned_err` doc 参照（P0 是正・イシュー #1624 PR #1681
+        // レビュー）。
+        poisoned_err(&nodes[n])?;
+        Ok(t.clone())
+    } else if let Some(t) = computed.get(&n) {
+        Ok(t.clone())
+    } else {
+        lazy_leaf_value_fallible(nodes, ops, n, recompute_memo)
+    }
 }
 
 /// 層 1（fallible 境界）: 後続の fallible `Var` 演算（`matmul`/`sum`/
@@ -1619,28 +2179,33 @@ pub(crate) fn materialize_fallible<'a>(
     id: NodeId,
 ) -> Result<&'a Tensor<f32>, AutodiffError> {
     if let Some(v) = nodes[id.0].value.get() {
+        // `poisoned_err` doc 参照（P0 是正・イシュー #1624 PR #1681
+        // レビュー）: 層 2 が過去にゼロ埋めで吸収した値を層 1 が
+        // 「正しい実体化結果」として信頼しないための検査。
+        poisoned_err(&nodes[id.0])?;
         return Ok(v);
     }
 
-    // view ノード（イシュー #1047）: `build_lazy_plan`（elementwise 5
-    // 演算の連結成分専用）を経由せず、`resolve_view` で入力側から直接
-    // 再導出する。結果（入力と `Arc` 共有の view ヘッダ）は他の実体化
-    // 経路と同じく対象ノード自身の `OnceCell` にのみキャッシュする。
-    if nodes[id.0].op.is_view() {
-        let computed = resolve_view(nodes, id);
-        match nodes[id.0].value.set(computed) {
-            Ok(()) => {}
-            Err(_rejected) => { /* fan-out 二重到達: 既存値を正として使う */ }
-        }
+    // view ノード（イシュー #1047）／activation checkpointing 解放済み
+    // ノード（イシュー #1624・`TapeNode::recompute`）: `build_lazy_plan`
+    // （elementwise 5 演算の連結成分専用）を経由せず、
+    // `recompute_fallible` で入力側から直接再導出する（前者は常に
+    // 未実体化で登場し、後者は checkpoint 解放時に `value.take()` 済み。
+    // いずれも同じ「入力から再導出可能」契約）。結果は他の実体化経路と
+    // 同じく対象ノード自身の `OnceCell` にのみキャッシュする
+    // （`recompute_fallible` 自身が `set` 済みのため、ここでは
+    // `get` するだけでよい）。
+    if nodes[id.0].op.is_view() || nodes[id.0].recompute {
+        recompute_fallible(nodes, ops, id)?;
         return nodes[id.0].value.get().ok_or_else(|| {
             AutodiffError::Backward(
-                "materialize_fallible: OnceCell 不変条件違反（view 解決後の set 直後に get が None を返した）"
+                "materialize_fallible: OnceCell 不変条件違反（再計算後の set 直後に get が None を返した）"
                     .into(),
             )
         });
     }
 
-    let (plan, leaves, _root) = build_lazy_plan(nodes, id).map_err(AutodiffError::Backend)?;
+    let (plan, leaves, _root) = build_lazy_plan(nodes, ops, id)?;
     let leaf_refs: Vec<&Tensor<f32>> = leaves.iter().collect();
     let computed = match ops.run_fused(&plan, &leaf_refs) {
         Ok(t) => t,
@@ -1649,7 +2214,7 @@ pub(crate) fn materialize_fallible<'a>(
         // 意味する（上記ドキュメンテーションコメント参照。Cursor
         // Bugbot・PR #403 是正）。per-op フォールバックへ委譲する。
         Err(BackendError::Unsupported(_)) | Err(BackendError::ShapeMismatch(_)) => {
-            fallback_per_op(nodes, ops, id).map_err(AutodiffError::Backend)?
+            fallback_per_op(nodes, ops, id)?
         }
         Err(other) => return Err(AutodiffError::Backend(other)),
     };
@@ -1675,6 +2240,21 @@ pub(crate) fn materialize_fallible<'a>(
 /// 場合に限り `autodiff` 自身の `eval.rs`（#164 で非 panic 構造へ改修
 /// 済み）を最終手段として用いて再計算する。必ず `Tensor<f32>` を返し、
 /// `panic!` も `Err` も返さない。
+///
+/// **poison 契約（P0 是正・codex-review 指摘。イシュー #1624 PR #1681
+/// レビュー）**: 本関数は `&'a Tensor<f32>` を返す必要があり
+/// `OnceCell` を必ず埋めるため、checkpoint 解放済みノードの再計算
+/// （`recompute_infallible` 経由）が真のバックエンド実行失敗を起こした
+/// 場合でも `debug_assert! + safe_zeros` で吸収した結果をそのまま
+/// `OnceCell` へ書き込む——この事実自体は消せない（層 2 が infallible
+/// である以上、値を返さない選択肢がない）。代わりに
+/// `TapeNode::recompute_failed` を立てて汚染の事実を記録し、以後
+/// [`materialize_fallible`]（層 1。`Tape::backward`／`grad.rs` の VJP が
+/// 使う）がこのノードのキャッシュ済み値を読む前に検査して `Err` へ
+/// 変換する（`poisoned_err` 参照）。したがって `Var::value()`／
+/// `Var::to_tensor()` 単体の呼び出しは（契約どおり）ゼロテンソルを
+/// 返すが、その値をもとに `Tape::backward` を呼ぶと汚染が検出されて
+/// `Err` になる——「ゼロ勾配が静かに成功として返る」事故を防ぐ。
 pub(crate) fn materialize_non_fallible<'a>(
     nodes: &'a [TapeNode],
     ops: &dyn BackendOps,
@@ -1689,20 +2269,21 @@ pub(crate) fn materialize_non_fallible<'a>(
     // 値を返すため、この経路は構造的に失敗しない
     // （`docs/fusion-graph-design.md` §3.5.3 (i)〜(iii)）。
     nodes[id.0].value.get_or_init(|| {
-        // view ノード（イシュー #1047）: 融合・per-op フォールバックの
-        // 前に最優先で判定する（`resolve_view` は infallible なため、
-        // ここで確実に値が決まる。層 1 の同分岐と対応）。
-        if nodes[id.0].op.is_view() {
-            return resolve_view(nodes, id);
+        // view ノード（イシュー #1047）／checkpoint 解放済みノード
+        // （イシュー #1624）: 融合・per-op フォールバックの前に最優先で
+        // 判定する（`recompute_infallible` は infallible なため、ここで
+        // 確実に値が決まる。層 1 の同分岐と対応）。
+        if nodes[id.0].op.is_view() || nodes[id.0].recompute {
+            return recompute_infallible(nodes, ops, id);
         }
-        build_lazy_plan(nodes, id)
+        build_lazy_plan(nodes, ops, id)
             .ok()
             .and_then(|(plan, leaves, _root)| {
                 let leaf_refs: Vec<&Tensor<f32>> = leaves.iter().collect();
                 ops.run_fused(&plan, &leaf_refs).ok()
             })
             .or_else(|| fallback_per_op(nodes, ops, id).ok())
-            .unwrap_or_else(|| eval_fallback(nodes, id))
+            .unwrap_or_else(|| eval_fallback(nodes, ops, id))
     })
 }
 
@@ -1710,7 +2291,7 @@ pub(crate) fn materialize_non_fallible<'a>(
 /// 失敗した場合、`autodiff` 自身の `eval.rs`（#164 で非 panic 構造へ
 /// 改修済み）を用いてトポロジカル順に逐次再計算する（`docs/
 /// fusion-graph-design.md` §3.5.3。層 2 限定の例外）。
-fn eval_fallback(nodes: &[TapeNode], id: NodeId) -> Tensor<f32> {
+fn eval_fallback(nodes: &[TapeNode], ops: &dyn BackendOps, id: NodeId) -> Tensor<f32> {
     use std::collections::HashMap;
 
     let mut reachable: HashMap<usize, ()> = HashMap::new();
@@ -1747,7 +2328,7 @@ fn eval_fallback(nodes: &[TapeNode], id: NodeId) -> Tensor<f32> {
             computed
                 .get(&n)
                 .cloned()
-                .unwrap_or_else(|| lazy_leaf_value(nodes, n))
+                .unwrap_or_else(|| lazy_leaf_value(nodes, ops, n))
         }
     };
     for &cur in &interior {

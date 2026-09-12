@@ -71,3 +71,12 @@ serde_json.workspace = true
 name = "view_zero_alloc"
 path = "tests/view_zero_alloc.rs"
 harness = false
+
+# activation checkpointing（イシュー #1624）の「forward+backward の
+# ピークメモリが非 checkpoint より小さい」という受け入れ条件を、上記と
+# 同じ `TrackingAllocator` プロセス分離方式で実測する専用テスト
+# ターゲット。
+[[test]]
+name = "checkpoint_peak_memory"
+path = "tests/checkpoint_peak_memory.rs"
+harness = false

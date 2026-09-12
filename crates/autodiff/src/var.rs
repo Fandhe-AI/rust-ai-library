@@ -857,6 +857,37 @@ impl<'t> Var<'t> {
         Var::from_raw(self.tape, id)
     }
 
+    /// activation checkpointing（イシュー #1624・`docs/
+    /// autodiff-checkpoint-design.md`）: `self` を区間の出力、`inputs`
+    /// を区間の外側入力として、`inputs` より後・`self` 以前に push
+    /// された再計算可能ノード（`Op::is_checkpoint_eligible()`）を解放
+    /// する（`Tape::register_checkpoint` 経由）。`self` 自身は解放
+    /// されない（呼び出し元が戻り値として保持し続けるため）。
+    ///
+    /// [`Tape::checkpoint`]（閉包版）の低儀式な代替入口——facade は
+    /// `Tape` newtype への新規 `pub fn` 追加を承認事項として保留して
+    /// いる一方、`Var` は素で再エクスポート済みのため、本メソッドが
+    /// facade 経由でも到達可能な唯一の checkpoint 入口となる
+    /// （`docs/compat-api-scope.md` §1.3）。
+    ///
+    /// `inputs` が空の場合、区間はテープ先頭（node id 0）から `self`
+    /// までとする。`inputs` のいずれかが別 `Tape` に属する場合は
+    /// `Err(TapeMismatch)`（クロステープ検査。`check_same_tape` doc
+    /// 参照）。`self` の node id が `inputs` のどれよりも小さい（区間が
+    /// 空）場合は no-op で `self` をそのまま返す。
+    pub fn checkpoint_from(&self, inputs: &[&Var<'t>]) -> Result<Var<'t>, AutodiffError> {
+        for &input in inputs {
+            self.check_same_tape(input)?;
+        }
+        let lo = inputs.iter().map(|v| v.node_id().0 + 1).max().unwrap_or(0);
+        let output_id = self.id.0;
+        if output_id < lo {
+            return Ok(Var::from_raw(self.tape, self.id));
+        }
+        self.tape.register_checkpoint(lo, output_id)?;
+        Ok(Var::from_raw(self.tape, self.id))
+    }
+
     /// 新しい shape へ再解釈する view 系ノード（イシュー #1047・親
     /// #1043）。`Tensor::reshape`（`tensor-core`）と同じく contiguous な
     /// 入力に限り zero-copy（案 A・エラー方式。`docs/spec/

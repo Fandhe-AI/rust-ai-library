@@ -138,20 +138,28 @@ impl Tape {
             return Err(AutodiffError::TapeMismatch);
         }
 
-        // `backward` はノードを追加しないため、走査全体を単一の不変
-        // 借用で完結させる（`Var::value()`/`to_tensor()` のドキュメント
-        // が警告する `RefCell` 二重可変借用 panic の経路をそもそも
-        // 作らない）。
-        let nodes = self.nodes.borrow();
-        let n = nodes.len();
+        // `backward` はノードを追加しないため、`n` は事前に確定して
+        // よい。ただし activation checkpointing（イシュー #1624）の
+        // 再解放（`release_checkpoints_ending_at`）が逆走査の途中で
+        // `self.nodes.borrow_mut()` を要求するため、走査全体を単一の
+        // 不変借用で完結させていた旧実装から**反復ごとに借用を取得
+        // ・その反復内で drop する**方式へ変更した（`RefCell` の二重
+        // 可変借用 panic を避けるための実装規律は変わらないが、
+        // 借用の生存期間を反復単位へ narrow 化する。`docs/
+        // autodiff-checkpoint-design.md` §3.1 点 4・`Tape::
+        // release_checkpoints_ending_at` doc 参照）。
+        let n = self.nodes.borrow().len();
 
         let mut grads: Vec<Option<Tensor<f32>>> = vec![None; n];
         // `loss` 自身が forward 記録済みの未実体化ノード（elementwise の
         // 遅延グラフの末端）である場合に備え、`materialize_fallible`
         // （層 1）経由で shape を読む（TASK-12.1d・#164）。
-        let loss_shape = crate::tape::materialize_fallible(&nodes, self.ops(), loss.node_id())?
-            .shape()
-            .to_vec();
+        let loss_shape = {
+            let nodes = self.nodes.borrow();
+            crate::tape::materialize_fallible(&nodes, self.ops(), loss.node_id())?
+                .shape()
+                .to_vec()
+        };
         // `loss_shape` は既に構築済みの `loss.value`（同 shape のテンソル）から
         // 取得しているため、現行の `tensor-core` 実装では本分岐は到達不能
         // （同 shape での `full()` が失敗する経路が存在しない）。ただし
@@ -178,43 +186,68 @@ impl Tape {
             // しか処理しないが、値自体は結果として保持し続ける必要が
             // ある。取り除くと非葉ノードの `get()` が常に `None` になる）。
             let Some(upstream) = grads[id].clone() else {
+                // 勾配未到達（loss から辿れない部分グラフ）でも、`id` が
+                // いずれかの checkpoint 区間の `lo` に一致する場合は
+                // 当該区間の再解放を行う必要がある（イシュー #1624
+                // review 指摘）。区間内で最初に push されたノード
+                // （`lo`）が loss への勾配経路上にない場合（区間内の
+                // 使い捨て中間値や `checkpoint_from` の介在ノードが
+                // `lo` に来るケース）でも「backward が区間を離れたら
+                // 再び捨てる」契約（`docs/autodiff-checkpoint-design.md`
+                // §3.1 点 4）を成立させるため、`continue` より前に
+                // 呼ぶ（下の通常経路と同じ呼び出しを重複させず一本化
+                // する）。
+                self.release_checkpoints_ending_at(id)?;
                 continue;
             };
-            // ノード自身の forward 値（`out_value`）を層 1（fallible）
-            // 経由で実体化する。当該ノードが elementwise の遅延グラフ
-            // 末端の場合に備える（TASK-12.1d・#164。`Var::value()`〈層
-            // 2〉は呼ばず、`Unsupported` 以外の失敗は `?` で伝播する）。
-            let node = &nodes[id];
-            // `Op::ResidentLeaf`（イシュー #1022）はホスト値を持たない
-            // （`TapeNode::value` が常に空。`Tape::push_resident_leaf`
-            // 参照）ため、`materialize_fallible` を呼ぶと「実体化済みの
-            // はずが未実体化だった」契約違反フォールバック（`tape.rs::
-            // lazy_leaf_value` の `debug_assert!` + ゼロ埋め）に誤って
-            // 到達してしまう。`grad::vjp` は本 variant を `Op::Leaf` と
-            // 同じく `out_value` を参照しないため、プレースホルダで
-            // 十分（`Op::Leaf` は元々実体化済みで実害がなかったのと同じ
-            // 理由で、ここでも実際の値は使われない）。
-            let node_value = if matches!(node.op, Op::ResidentLeaf { .. }) {
-                Tensor::scalar(0.0)
-            } else {
-                crate::tape::materialize_fallible(&nodes, self.ops(), NodeId(id))?.clone()
+            // 本反復専用の借用（ブロック末で drop）。ノード自身の
+            // forward 値（`out_value`）を層 1（fallible）経由で実体化
+            // する。当該ノードが elementwise の遅延グラフ末端、または
+            // checkpoint 解放済み（イシュー #1624）の場合に備える
+            // （TASK-12.1d・#164。`Var::value()`〈層 2〉は呼ばず、
+            // `Unsupported` 以外の失敗は `?` で伝播する）。
+            let contributions = {
+                let nodes = self.nodes.borrow();
+                let node = &nodes[id];
+                // `Op::ResidentLeaf`（イシュー #1022）はホスト値を持たない
+                // （`TapeNode::value` が常に空。`Tape::push_resident_leaf`
+                // 参照）ため、`materialize_fallible` を呼ぶと「実体化済みの
+                // はずが未実体化だった」契約違反フォールバック（`tape.rs::
+                // recompute_fallible` の `Err` 分岐）に誤って到達して
+                // しまう。`grad::vjp` は本 variant を `Op::Leaf` と
+                // 同じく `out_value` を参照しないため、プレースホルダで
+                // 十分（`Op::Leaf` は元々実体化済みで実害がなかったのと同じ
+                // 理由で、ここでも実際の値は使われない）。
+                let node_value = if matches!(node.op, Op::ResidentLeaf { .. }) {
+                    Tensor::scalar(0.0)
+                } else {
+                    crate::tape::materialize_fallible(&nodes, self.ops(), NodeId(id))?.clone()
+                };
+                grad::vjp(
+                    &node.op,
+                    &node_value,
+                    &upstream,
+                    &nodes,
+                    self.ops(),
+                    resolver,
+                    // イシュー #1212 codex-review P0 追加是正: 差分対象
+                    // テープ自身（`self`）の `id`／`epoch()` を resident 経路
+                    // の由来検証用にスレッドする（`grad::vjp` doc 参照）。
+                    self.id,
+                    self.epoch(),
+                )?
             };
-            let contributions = grad::vjp(
-                &node.op,
-                &node_value,
-                &upstream,
-                &nodes,
-                self.ops(),
-                resolver,
-                // イシュー #1212 codex-review P0 追加是正: 差分対象
-                // テープ自身（`self`）の `id`／`epoch()` を resident 経路
-                // の由来検証用にスレッドする（`grad::vjp` doc 参照）。
-                self.id,
-                self.epoch(),
-            )?;
             for (target, contribution) in contributions {
                 accumulate(self.ops(), &mut grads, target, contribution)?;
             }
+            // activation checkpointing（イシュー #1624）の再解放:
+            // 上のブロックで `nodes`（`Ref`）は既に drop 済みのため、
+            // ここで `self.nodes.borrow_mut()`（`Tape::
+            // release_checkpoints_ending_at` 内部）を呼んでも二重借用
+            // panic にならない。`id` がいずれかの登録済み区間の `lo`
+            // と一致する場合のみ実際の解放が起きる（該当なしなら
+            // no-op）。
+            self.release_checkpoints_ending_at(id)?;
         }
 
         Ok(Gradients {

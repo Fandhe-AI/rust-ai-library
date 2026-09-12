@@ -449,6 +449,19 @@ Softmax`／`LogSoftmax`＋VJP・`autodiff::var::Var::softmax`／`log_softmax`・
 非最終軸 GPU 対応は out-of-scope として記録し、起票はユーザー承認後に限る
 （`.claude/rules/out-of-scope-tracking.md`）。
 
+## 追補（2026-09-13・イシュー #1624）
+
+§2.11 の「`torch.utils.checkpoint`（activation checkpointing）」行（上記
+表）は取り込み元スナップショットのギャップ記述のため変更していないが、
+同イシューで「部分」から「あり（対象 Op 限定）」へ前進した: `Var::
+checkpoint_from`（内部クレート `Tape::checkpoint` の低儀式な代替入口。
+facade へは既存の `Var` 再エクスポート経由で到達）を追加し、`Op::MatMul`／
+`Sigmoid`／`Sum`／`Max`（+ 既存の view 系 `Reshape`／`Transpose`）に限り
+forward の中間値を解放し backward 時に再計算する（`docs/
+autodiff-checkpoint-design.md`）。`MseLoss`／`CrossEntropyLoss`／
+`LinearAct`／`Softmax`／`LogSoftmax`・線形代数系は非対象のまま値を保持する
+（正しさ優先・エラーにはならない）。facade `Tape::checkpoint`（閉包版）
+passthrough は承認未取得のため未追加（`docs/compat-api-scope.md` §1.3）。
 ### 追補（イシュー #1596）
 
 §2.7 の表（`nn.LayerNorm`／RMSNorm の行）は本ドキュメント作成時点（対象 HEAD

@@ -30,6 +30,8 @@
 | REQ-12「利用者向け融合制御 API を提供しない」の受け入れ基準は `facade` を唯一の公開面としバックエンド結線を composition root に集約することで充足する設計（`create_graph` 相当のフラグを追加する場合、これが融合制御 API に該当しないことの整理が必要） | `docs/spec/04-requirements.md:277-280` |
 | PoC-v2-2（`docs/spec/03-poc/poc-v2-2-autodiff/README.md`）・`docs/public-api-design.md` §3 は 1 階の動的テープのみを確定しており高階微分への言及がない（grep 済み） | `docs/spec/03-poc/poc-v2-2-autodiff/README.md`・`docs/public-api-design.md` |
 
+**追記（イシュー #1624・activation checkpointing）**: 上表「`Tape::backward_impl` は逆走査ループ全体を単一の不変借用 `let nodes = self.nodes.borrow();` で完結させる」という事実は #1624 で変わった——checkpoint 区間の再解放（`Tape::release_checkpoints_ending_at`）が逆走査の途中で `self.nodes.borrow_mut()` を必要とするため、`backward_impl` は「反復ごとに `Ref` を取得し、その反復内（VJP 呼び出しまで）で drop する」方式へ再構成された（`crates/autodiff/src/backward.rs` の `for id in (0..n).rev() { let contributions = { let nodes = self.nodes.borrow(); ... }; ...; self.release_checkpoints_ending_at(id); }`）。ただし本節の結論（A-1「同一テープ方式」の困難）は不変: 依然として「ある反復の処理中（`Ref` が生存している間）に同一テープへ `push_*`〈`borrow_mut()`〉で VJP 演算を記録する」ことはできない（`Ref` の生存期間が反復単位に狭まっただけで、反復内で push しようとすれば同様に衝突する）。`docs/autodiff-checkpoint-design.md` §3.1 点 4 参照。
+
 ## 3. 契約整理（設計が守るべき既存契約）
 
 1. 1 階の `Tape::backward` の結果は**bit 同一で不変**（既存 backward／parity／bit 一致テスト群を後退させない）。REQ-2 統一複合判定・FMA 契約・tolerance／baseline はいずれも不変
